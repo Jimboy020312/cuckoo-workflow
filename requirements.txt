@@ -1,0 +1,3 @@
+openpyxl
+Appium-Python-Client
+selenium
