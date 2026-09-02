@@ -1,6 +1,0 @@
-git clone <your-repo-url>
-cd cuckoo-workflow
-python -m venv venv
-venv\Scripts\activate          (Windows)
-python -m pip install -r requirements.txt
-python main.py
