@@ -46,13 +46,42 @@ is a different, separate product-name value from that section of the
 app — both are genuine product names from different parts of the
 record, not a mislabeled dealer code.
 
+SKIP-KNOWN-CUSTOMERS NOTE
+--------------------------
+run() now skips re-scraping a customer whose sales_no is already in a
+previous export — their details don't change once captured, so
+there's nothing new to read there. Only genuinely new sales_no values
+get their View Order/CCS Note screens opened. Known customers are
+found wherever they appear while scrolling (not assumed to only be at
+the bottom) and carried forward into the new export exactly as they
+were before, with no fields re-read. See _load_carryforward_data() and
+the "skipping ... — already captured previously" check inside run().
+
+SPEED NOTE (known-customer scanning)
+--------------------------
+get_visible_customers_stable() waits for two consecutive matching
+reads before trusting what's on screen — a real protection against
+Android reusing list rows mid-scroll (a row can briefly show one
+customer's stale fields under another's already-updated NS No). That
+protection only matters for a card the script is about to actually
+SKIP or ACT ON. get_visible_customers_quick_or_stable() below does one
+fast read first; if every customer currently visible is either already
+handled this run or already known from a previous export, that fast
+read is trusted as-is (nothing about it is being acted on, so a stale
+field elsewhere on the card can't cause a wrong decision) and the slow
+stable protocol is skipped entirely. The moment anything new or
+incomplete shows up, it falls straight back to the full stable read
+before touching it. On a run where most customers are already known
+(the normal case after the first month), this removes a lot of the
+repeated ~0.4s settle waits that used to happen purely while scrolling
+past people who were only ever going to be skipped anyway.
+
 OUTPUT NOTE
 --------------------------
-Everything above and everything in the scraping/scrolling code below
-is UNCHANGED — only the final export step is different. The exported
-file only includes the 6 fields actually needed (sales_no, appt_date,
+The scraping/scrolling logic ABOVE this note is unchanged. The export
+step only includes the fields actually needed (sales_no,
 sales_info_product, install_contact_person, install_mobile1,
-install_address), in that order, plus proposed_date (typed by hand),
+install_address), plus proposed_date (typed by hand),
 a WhatsApp Message column (auto-fills once a date is typed, formatted
 to match the WhatsApp bold style: *Hanis*, *Tarikh:*, *Alamat:*,
 *Produk:*, *Nombor Pesanan:*), and a WhatsApp Link column — a tap-to-
@@ -86,7 +115,7 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = 4   # was 3 for testing — now processes the whole list
+LIST_LIMIT = None   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
 DEBUG = False
 
@@ -165,8 +194,22 @@ OUTPUT_FILE = "cuckoo_export.xlsx"
 # message pre-filled, sidestepping HYPERLINK()'s 255-char limit. If it
 # doesn't exist, everything still works — the export just falls back
 # to the plain .xlsx with a click-to-open-chat-then-paste link instead.
-TEMPLATE_FILE = "cuckoo_export_template.xlsm"
+# This is a SHARED file — one copy in the project's root folder, next
+# to this script — NOT something that needs copying into each
+# person's export folder; write_output() always reads it from here
+# regardless of which NDS-ID/name subfolder this run is writing into.
+TEMPLATE_FILE = "macro.xlsm"
 OUTPUT_FILE_XLSM = "cuckoo_export.xlsm"
+
+# OUTPUT_FILE / OUTPUT_FILE_XLSM above are just fallback defaults —
+# run() and resort_existing_file() both overwrite them at startup with
+# paths built from the specialist's identity + the month they typed in
+# (see _apply_identity_to_filenames()), e.g.
+# "NDS35095_Hanis/NDS35095_Hanis_September_v1_export.xlsm". This is
+# what lets colleagues share this same script safely: each person's
+# export lands in their own folder rather than everyone overwriting
+# one shared file.
+IDENTITY_CONFIG_FILE = "specialist_identity.json"
 
 WAIT_SECONDS = 10
 # raised since smaller, controlled scroll steps need more of them to reach the bottom
@@ -176,6 +219,12 @@ MAX_STAGNANT_ROUNDS = 2
 SCROLL_STEP_PERCENT = 0.32
 SCROLL_REGION_TOP_FRACTION = 0.40     # stays below the pinned filter header
 SCROLL_REGION_HEIGHT_FRACTION = 0.48
+# How long to pause after each scroll gesture for the view to settle
+# before reading it. Pulled out as its own knob (rather than a number
+# buried inside scroll_down) so it's easy to try lowering during
+# testing without hunting through the function — just watch for
+# misreads (skipped/duplicated customers) if you push it much lower.
+SCROLL_SETTLE_SECONDS = 0.6
 
 
 # ============================================================
@@ -388,7 +437,7 @@ def scroll_down(driver, percent=None):
         "direction": "down",
         "percent": percent,
     })
-    time.sleep(0.6)
+    time.sleep(SCROLL_SETTLE_SECONDS)
     dismiss_keyboard_if_present(driver)
 
 
@@ -639,6 +688,41 @@ def get_visible_customers_stable(driver, max_attempts=4, settle_delay=0.4):
     return customers
 
 
+def get_visible_customers_quick_or_stable(driver, known_sales_nos, seen_keys):
+    """
+    Speed optimization on top of get_visible_customers_stable() — see
+    the "SPEED NOTE" in this file's top docstring for the full
+    reasoning. Short version: the slow stable-read protocol only
+    matters for a card about to be SKIPPED or ACTED ON here. This does
+    one fast, single read first; if every customer currently visible is
+    either already handled this run (seen_keys) or already known from a
+    previous export (known_sales_nos), nothing about that card's other
+    fields is being trusted right now — only its identity, which is
+    what get_visible_customers_stable()'s own docstring confirms
+    updates promptly — so the fast read is used as-is. The instant
+    anything new or only-partially-rendered shows up, this falls back
+    to the full, careful stable read before touching it.
+    """
+    quick = get_visible_customers(driver)
+    if not quick:
+        return get_visible_customers_stable(driver)
+
+    for c in quick:
+        if not c.get("complete", True):
+            return get_visible_customers_stable(driver)
+        key = c["row"].get(KEY_FIELD)
+        if key in seen_keys:
+            continue
+        sales_no = _normalize_sales_no(c["row"].get("sales_no"))
+        if sales_no and sales_no in known_sales_nos:
+            continue
+        # Something here isn't already-handled/already-known — trust
+        # nothing from the fast read, do it properly.
+        return get_visible_customers_stable(driver)
+
+    return quick
+
+
 # ============================================================
 # Popup menu ("Choose Option") -> detail screen
 # ============================================================
@@ -793,7 +877,8 @@ def _is_valid_ccs_product_name(product):
 def get_ccs_note_cards(driver):
     """Reads every currently-visible card on the CCS Note screen,
     keeping only ones that pass the validity checks above."""
-    wait_for(driver, (AppiumBy.XPATH, '//android.widget.TextView[@text="CCS Note"]'))
+    wait_for(driver, (AppiumBy.XPATH,
+             '//android.widget.TextView[@text="CCS Note"]'))
 
     card_elements = driver.find_elements(
         AppiumBy.XPATH,
@@ -805,7 +890,8 @@ def get_ccs_note_cards(driver):
         parsed = parse_bounds(card_el.get_attribute("bounds"))
         if not parsed:
             continue
-        text_elements = card_el.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+        text_elements = card_el.find_elements(
+            AppiumBy.CLASS_NAME, "android.widget.TextView")
         texts = [read_text_safe(t) for t in text_elements]
         texts = [t for t in texts if t]  # drop empty separator TextViews
 
@@ -861,7 +947,8 @@ def get_all_ccs_note_cards(driver):
 
         stagnant_rounds = 0 if new_this_round > 0 else stagnant_rounds + 1
 
-        target_percent = compute_scroll_percent(driver, cards[-1]["card_top_y"])
+        target_percent = compute_scroll_percent(
+            driver, cards[-1]["card_top_y"])
         scroll_down(driver, percent=target_percent)
         scroll_count += 1
 
@@ -904,7 +991,381 @@ def _reconcile_ccs_cards(cards):
 # Main loop: scroll + scrape until nothing new appears
 # ============================================================
 
+def _normalize_sales_no(value):
+    """
+    Excel can silently convert a Sales No. cell from text to a real
+    number — its own "Number Stored as Text" auto-fix does this with
+    one click, and even just re-typing a value can trigger it. Meanwhile
+    a live app scrape is ALWAYS a string (Appium's .text always returns
+    text, never a number). Without normalizing both sides to the same
+    type, "413643" (from the app) and 413643 (from Excel) are NOT equal
+    in Python — confirmed: this is exactly what caused a known, already-
+    captured customer to be silently re-scraped in full instead of
+    skipped, purely because of this type mismatch (nothing to do with
+    ordering or position). Every place a sales_no crosses the Excel <->
+    live-app boundary is normalized through this function first.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        # Excel sometimes stores a whole number as a float (413643.0) —
+        # strip the trailing .0 so it matches the plain-digit string a
+        # scrape would produce ("413643", not "413643.0").
+        return str(int(value))
+    return str(value).strip()
+
+
+def _normalize_phone_digits(value):
+    """
+    Same problem as _normalize_sales_no(), same fix — the hidden
+    WhatsApp Number column stores a plain digit string (e.g.
+    "60123456789"), and Excel can just as easily silently convert that
+    to a real number the same way it does Sales No. cells. Carrying
+    that forward without normalizing would risk clean_phone_for_wa()
+    choking on a non-string value on the next run.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+# ============================================================
+# Specialist identity + per-month export filenames
+# ============================================================
+#
+# This is what makes the script safe to hand to colleagues: the
+# WhatsApp message text used to hardcode "Hanis"/"NDS35095", and the
+# export always landed in one shared "cuckoo_export.xlsm" regardless
+# of who ran it or when. Now each person's Name + NDS Cuckoo ID is
+# asked for ONCE (cached locally — see IDENTITY_CONFIG_FILE) and used
+# both to personalize the message and to build a per-person, per-month
+# filename, so nobody's export or message text collides with anyone
+# else's.
+
+def _load_or_prompt_identity():
+    """
+    Asks which specialist's list this run is for — EVERY run, not just
+    the first — since this script might be run for a different person
+    entirely (e.g. covering a colleague's list), and silently reusing
+    whoever answered last would risk exporting/messaging under the
+    wrong name.
+
+    The last values used are read from IDENTITY_CONFIG_FILE and shown
+    as defaults (just press Enter to keep them), purely so running it
+    again and again for yourself doesn't mean retyping your own name
+    and ID every time. Whatever's answered — kept default or a new
+    value typed in — is saved back to that file so it becomes next
+    run's default.
+    """
+    import json
+
+    last_name, last_nds_id = "", ""
+    if os.path.exists(IDENTITY_CONFIG_FILE):
+        try:
+            with open(IDENTITY_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            last_name = (data.get("name") or "").strip()
+            last_nds_id = (data.get("nds_id") or "").strip()
+        except Exception:
+            pass  # missing/corrupted — just means no defaults to offer
+
+    name_prompt = (f"Specialist's name [{last_name}]: " if last_name
+                   else "Specialist's name (as it should appear in the WhatsApp message): ")
+    name = input(name_prompt).strip() or last_name
+
+    nds_prompt = (f"Specialist's NDS Cuckoo ID [{last_nds_id}]: " if last_nds_id
+                  else "Specialist's NDS Cuckoo ID (e.g. NDS35095): ")
+    nds_id = input(nds_prompt).strip() or last_nds_id
+
+    with open(IDENTITY_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"name": name, "nds_id": nds_id}, f)
+    return name, nds_id
+
+
+def _slugify(text):
+    """
+    Turns free text into something safe to use inside a filename —
+    keeps letters/digits, collapses everything else (spaces,
+    punctuation) into a single underscore, trims leading/trailing
+    underscores. Used for both the specialist's name and NDS ID when
+    building the export filename, since either could contain a space
+    or punctuation that Windows filenames don't like.
+    """
+    text = re.sub(r"[^A-Za-z0-9]+", "_", (text or "").strip())
+    return text.strip("_") or "Unknown"
+
+
+def _default_month_label():
+    """e.g. 'September' — today's real calendar month, used only as the
+    suggested default in _prompt_month_label(); the person can type a
+    different month if this export is actually for a different one."""
+    import datetime
+    return datetime.date.today().strftime("%B")
+
+
+def _prompt_month_label():
+    """
+    Asks which month this export is for, defaulting to the current
+    calendar month if the person just presses Enter. Asked every run
+    (not cached like the identity) since which month you're working on
+    legitimately changes far more often than your name or NDS ID.
+    """
+    default = _default_month_label()
+    entered = input(f"Which month is this export for? [{default}]: ").strip()
+    return entered or default
+
+
+# Which existing file (if any) this run should read carry-forward data
+# from — set by _apply_identity_to_filenames() before anything else
+# runs. This is DIFFERENT from OUTPUT_FILE/OUTPUT_FILE_XLSM below: the
+# version number increases by one on every run, so the file this run
+# WRITES to is never the same file it READS from.
+CARRYFORWARD_SOURCE_FILE = None
+
+
+def _apply_identity_to_filenames(name, nds_id, month_label):
+    """
+    Rebuilds the module-level OUTPUT_FILE / OUTPUT_FILE_XLSM /
+    CARRYFORWARD_SOURCE_FILE paths from the specialist's identity and
+    the month they typed in.
+
+    Folder layout: one shared folder per person, "<NDSID>_<Name>/",
+    holding every version for every month as flat files named
+    "<NDSID>_<Name>_<Month>_v<N>_export.xlsm" — e.g.
+    "NDS35095_Hanis/NDS35095_Hanis_September_v1_export.xlsm". Nothing
+    ever gets deleted; a rerun in the same month bumps N and adds a
+    new file alongside the old ones.
+
+    RESUMING AN INTERRUPTED RUN: while a run is in progress (or if it
+    got cut short — crash, Ctrl+C, LIST_LIMIT, or the scroll safety
+    cap), its file is named with an extra "_incomplete" tag, e.g.
+    "..._v3_export_incomplete.xlsm". If the highest version found here
+    for this person+month is still tagged "_incomplete", THIS run
+    reuses that EXACT same filename as both its carry-forward source
+    and its write target — no new version number — so a rerun after a
+    crash keeps filling in that same file instead of abandoning it and
+    starting a fresh version. Only once a run reaches the genuine end
+    of the app's list does _finalize_output_file() (called from run())
+    drop the "_incomplete" tag, which is what makes the NEXT deliberate
+    run pick a brand new version number instead of resuming.
+
+    A month with no matching files yet naturally starts fresh at v1
+    with no carry-forward source — the intended behaviour, since a
+    visit plan (Proposed Dates especially) is specific to its month.
+    """
+    global OUTPUT_FILE, OUTPUT_FILE_XLSM, CARRYFORWARD_SOURCE_FILE
+
+    person_folder = f"{_slugify(nds_id)}_{_slugify(name)}"
+    os.makedirs(person_folder, exist_ok=True)
+
+    base_no_version = f"{_slugify(nds_id)}_{_slugify(name)}_{_slugify(month_label)}"
+    complete_pattern = re.compile(
+        r"^" + re.escape(base_no_version) + r"_v(\d+)_export\.(xlsm|xlsx)$")
+    incomplete_pattern = re.compile(
+        r"^" + re.escape(base_no_version) + r"_v(\d+)_export_incomplete\.(xlsm|xlsx)$")
+
+    best_version = 0
+    best_file = None
+    best_is_xlsm = False
+    best_is_incomplete = False
+    for fname in os.listdir(person_folder):
+        m = incomplete_pattern.match(fname)
+        is_incomplete = m is not None
+        if not m:
+            m = complete_pattern.match(fname)
+        if not m:
+            continue
+        version = int(m.group(1))
+        is_xlsm = m.group(2) == "xlsm"
+        # Highest version wins outright. On a tie: an incomplete file
+        # beats a complete one (it's the true latest in-progress
+        # state), and among those, .xlsm beats .xlsx.
+        better = (
+            version > best_version
+            or (version == best_version and is_incomplete and not best_is_incomplete)
+            or (version == best_version and is_incomplete == best_is_incomplete
+                and is_xlsm and not best_is_xlsm)
+        )
+        if better:
+            best_version = version
+            best_file = fname
+            best_is_xlsm = is_xlsm
+            best_is_incomplete = is_incomplete
+
+    if best_file and best_is_incomplete:
+        # Resume this exact file in place — same version, same name.
+        source_path = os.path.join(person_folder, best_file)
+        CARRYFORWARD_SOURCE_FILE = source_path
+        if best_is_xlsm:
+            OUTPUT_FILE_XLSM = source_path
+            OUTPUT_FILE = source_path[:-len(".xlsm")] + ".xlsx"
+        else:
+            OUTPUT_FILE = source_path
+            OUTPUT_FILE_XLSM = source_path[:-len(".xlsx")] + ".xlsm"
+        return
+
+    CARRYFORWARD_SOURCE_FILE = os.path.join(
+        person_folder, best_file) if best_file else None
+
+    next_version = best_version + 1
+    versioned_base = f"{base_no_version}_v{next_version}_export_incomplete"
+    OUTPUT_FILE = os.path.join(person_folder, f"{versioned_base}.xlsx")
+    OUTPUT_FILE_XLSM = os.path.join(person_folder, f"{versioned_base}.xlsm")
+
+
+def _finalize_output_file(written_to, reached_natural_end):
+    """
+    Called once per run, right after write_output() has saved. If the
+    run genuinely reached the end of the app's list (reached_natural_end
+    — see run()), this drops the "_incomplete" tag from the file that
+    was just written, marking it done: the NEXT run will then pick a
+    fresh version number instead of resuming it (see
+    _apply_identity_to_filenames()).
+
+    If the run was cut short for any reason — crash, Ctrl+C,
+    LIST_LIMIT, or the scroll safety cap — this leaves the file exactly
+    as it is (still "_incomplete"), so next time you run the script it
+    picks this same file back up and keeps filling it in, rather than
+    treating it as done and starting a new version.
+
+    Returns the file's final path (renamed or not) so callers can print
+    the name the person should actually go look for.
+    """
+    if not written_to or not os.path.exists(written_to):
+        return written_to
+
+    if not reached_natural_end:
+        print(f"Didn't reach the end of the app's list this run — "
+              f"{written_to} stays marked in-progress. Rerunning will "
+              f"continue filling in this same file rather than starting "
+              f"a new version.")
+        return written_to
+
+    if "_export_incomplete." not in written_to:
+        return written_to  # already finalized somehow — nothing to do
+
+    finalized = written_to.replace("_export_incomplete.", "_export.")
+    try:
+        if os.path.exists(finalized):
+            os.remove(finalized)
+        os.rename(written_to, finalized)
+        print(f"Reached the end of the app's list — finalized as {finalized}.")
+        return finalized
+    except OSError as e:
+        print(f"  !! Could not finalize {written_to} to {finalized} ({e}) — "
+              f"it'll still work fine, just keeps the '_incomplete' name.")
+        return written_to
+
+
+def _load_carryforward_data():
+    """
+    Reads whichever export file already exists and returns everything
+    needed to SKIP re-scraping a customer whose sales_no is already in
+    it, while still including them correctly in this run's output:
+
+      known_sales_nos -> set of sales_no values already captured in a
+                          previous run. run() uses this to skip opening
+                          View Order/CCS Note for these — per Hazim's
+                          explicit call, a customer's details don't
+                          change once captured, so there's nothing new
+                          to read there.
+      carried_records -> {sales_no: {...plain fields...}}, read straight
+                          from the existing file's own columns, so an
+                          already-known customer's row can be reproduced
+                          in the new export without the app ever being
+                          touched for them this run. The phone number
+                          (install_mobile1) is recovered from the hidden
+                          WhatsApp Number column, since the visible
+                          Mobile No. 1 column was removed — that hidden
+                          column already holds the cleaned digits, and
+                          re-cleaning an already-clean number through
+                          clean_phone_for_wa() is a no-op.
+      carried_filters -> {sales_no: filters_text}, read straight from
+                          the Filter(s) column, same reasoning.
+
+    Proposed Date and Area 1-4 are NOT included here on purpose — those
+    already have their own carry-forward logic inside write_output()
+    (_load_existing_area_values / _load_existing_proposed_dates), which
+    reads the same file independently and applies "existing value always
+    wins." Duplicating that here would just be redundant.
+
+    Returns (set(), {}, {}) if no export file exists yet (first-ever
+    run — nothing to skip, everyone gets scraped), or if the existing
+    file is from too different a layout to safely reuse (missing a
+    required column) — safer to re-scrape everyone than guess.
+    """
+    target_file = CARRYFORWARD_SOURCE_FILE
+    if not target_file:
+        return set(), {}, {}
+
+    wb = openpyxl.load_workbook(target_file, data_only=False)
+    try:
+        ws = wb.active
+        header_row = [c.value for c in ws[1]]
+        col = {name: idx + 1 for idx, name in enumerate(header_row) if name}
+
+        required = ["Sales No.", "Appointment Date", "Installation / Service Contact Person",
+                    "Installation / Service Address", "Product", "WhatsApp Number"]
+        if any(name not in col for name in required):
+            print(f"  !! {target_file}'s header row is missing required columns — "
+                  f"can't safely skip/carry forward from it. Re-scraping everyone "
+                  f"this run instead.")
+            return set(), {}, {}
+
+        known_sales_nos = set()
+        carried_records = {}
+        carried_filters = {}
+        for row_idx in range(2, ws.max_row + 1):
+            sales_no = _normalize_sales_no(
+                ws.cell(row=row_idx, column=col["Sales No."]).value)
+            if not sales_no:
+                continue
+            known_sales_nos.add(sales_no)
+            carried_records[sales_no] = {
+                "sales_no": sales_no,
+                "appt_date": ws.cell(row=row_idx, column=col["Appointment Date"]).value or "",
+                "install_contact_person": ws.cell(row=row_idx, column=col["Installation / Service Contact Person"]).value or "",
+                "install_mobile1": _normalize_phone_digits(
+                    ws.cell(row=row_idx, column=col["WhatsApp Number"]).value),
+                "install_address": ws.cell(row=row_idx, column=col["Installation / Service Address"]).value or "",
+                "sales_info_product": ws.cell(row=row_idx, column=col["Product"]).value or "",
+            }
+            if "Filter(s)" in col:
+                filters_text = ws.cell(
+                    row=row_idx, column=col["Filter(s)"]).value
+                if filters_text:
+                    carried_filters[sales_no] = filters_text
+        return known_sales_nos, carried_records, carried_filters
+    finally:
+        wb.close()
+
+
 def run():
+    import traceback
+
+    name, nds_id = _load_or_prompt_identity()
+    month_label = _prompt_month_label()
+    _apply_identity_to_filenames(name, nds_id, month_label)
+    print(f"Specialist: {name} ({nds_id}) | Month: {month_label}")
+    write_target = OUTPUT_FILE_XLSM if os.path.exists(
+        TEMPLATE_FILE) else OUTPUT_FILE
+    if CARRYFORWARD_SOURCE_FILE:
+        print(f"Continuing from {CARRYFORWARD_SOURCE_FILE} — this run will "
+              f"write {write_target}.")
+    else:
+        print(f"No existing file found for {name} ({nds_id}) in {month_label} — "
+              f"starting fresh. This run will write {write_target}.")
+
+    known_sales_nos, carried_records, carried_filters = _load_carryforward_data()
+    if known_sales_nos:
+        print(f"Found {len(known_sales_nos)} customer(s) already captured in a "
+              f"previous export — these will be SKIPPED (their details aren't "
+              f"re-read, since they don't change), reused as-is if still found "
+              f"in the app, and REMOVED from the output if no longer found. "
+              f"Only genuinely new sales_no values get fully scraped.")
+
     driver = build_driver()
     time.sleep(3)
 
@@ -913,6 +1374,27 @@ def run():
     seen_keys = set()
     stagnant_rounds = 0
     scroll_count = 0
+    run_start_time = time.time()
+    customer_durations = []
+    # Every sales_no actually confirmed present in the app this run —
+    # whether skipped (already known) or freshly scraped (new). Anyone
+    # from a previous export who's NOT in this set by the end is treated
+    # as removed from the app, PROVIDED reached_natural_end is True (see
+    # below) — otherwise removal isn't safe to trust.
+    confirmed_present_sales_nos = set()
+    # Same information as confirmed_present_sales_nos, but as a LIST in
+    # the order each sales_no was first encountered this run — a set has
+    # no order at all. This is what lets the final export follow the
+    # app's CURRENT ordering (which can genuinely change month to month)
+    # instead of always resorting alphabetically by Sales No.
+    sales_no_order = []
+    # Only True if scrolling reached the genuine end of the list (no new
+    # customers found after scrolling further) — NOT true if LIST_LIMIT
+    # cut the run short (e.g. while testing) or the safety scroll cap
+    # was hit. Removal logic below only runs when this is True, since a
+    # partial scan can't distinguish "genuinely removed from the app"
+    # from "just hasn't been scrolled to yet."
+    reached_natural_end = False
 
     try:
         while True:
@@ -920,10 +1402,12 @@ def run():
                 print(f"Reached LIST_LIMIT of {LIST_LIMIT} — stopping.")
                 break
 
-            customers = get_visible_customers_stable(driver)
+            customers = get_visible_customers_quick_or_stable(
+                driver, known_sales_nos, seen_keys)
 
             next_customer = None
             partial_customer = None
+            skipped_this_round = False
             for c in customers:
                 key = c["row"].get(KEY_FIELD)
                 if not key or key in seen_keys:
@@ -938,6 +1422,30 @@ def run():
                     # rather than treating this like "nothing new at all."
                     if partial_customer is None:
                         partial_customer = c
+                    continue
+                sales_no_value = _normalize_sales_no(c["row"].get("sales_no"))
+                if sales_no_value:
+                    # Confirmed present in the app THIS run, regardless of
+                    # whether it gets skipped (already known) or scraped
+                    # fresh (new) — this is what the end-of-run removal
+                    # check is based on. Only append to the ORDER list the
+                    # first time — the same card can be scanned again
+                    # across consecutive scroll reads before it's marked
+                    # "seen", and it must only claim one position.
+                    if sales_no_value not in confirmed_present_sales_nos:
+                        sales_no_order.append(sales_no_value)
+                    confirmed_present_sales_nos.add(sales_no_value)
+                if sales_no_value and sales_no_value in known_sales_nos:
+                    # Already fully captured in a previous run, and a
+                    # customer's details don't change once captured — so
+                    # there's nothing new to read by opening this one. Mark
+                    # it handled and keep scanning; a genuinely new customer
+                    # could appear anywhere in the list, not necessarily
+                    # after this point, so scrolling continues normally.
+                    print(
+                        f"  [{len(confirmed_present_sales_nos)}] skipping {sales_no_value} — already captured previously")
+                    seen_keys.add(key)
+                    skipped_this_round = True
                     continue
                 next_customer = c
                 break
@@ -961,10 +1469,36 @@ def run():
                     scroll_down(driver, percent=target_percent)
                     continue
 
+                if skipped_this_round:
+                    # We successfully handled (skipped) known customers this
+                    # round — real progress, just nothing left to actively
+                    # open in the CURRENT view. This must NOT count as
+                    # stagnant: a long run of consecutive known customers
+                    # (e.g. 50 in a row) would otherwise trip the "reached
+                    # the end" check after just a couple of rounds, long
+                    # before actually reaching the true end of the list —
+                    # which would leave later customers unscanned and, worse,
+                    # make the removal logic below wrongly think they'd
+                    # disappeared from the app.
+                    stagnant_rounds = 0
+                    scroll_count += 1
+                    if scroll_count >= MAX_SCROLLS:
+                        print(
+                            "Hit the safety scroll limit — stopping to avoid an infinite loop.")
+                        break
+                    target_percent = compute_scroll_percent(
+                        driver, customers[-1]["card_top_y"]) if customers else SCROLL_STEP_PERCENT
+                    scroll_down(driver, percent=target_percent)
+                    continue
+
                 stagnant_rounds += 1
                 if stagnant_rounds >= MAX_STAGNANT_ROUNDS:
                     print(
                         "No new customers found after scrolling — reached the end of the list.")
+                    # This is the ONLY point where we can trust the whole
+                    # list was actually scanned — see confirmed_present_sales_nos
+                    # / reached_natural_end usage after the loop.
+                    reached_natural_end = True
                     break
                 scroll_count += 1
                 if scroll_count >= MAX_SCROLLS:
@@ -983,8 +1517,17 @@ def run():
             next_row = next_customer["row"]
             key = next_row[KEY_FIELD]
             seen_keys.add(key)
+            customer_start_time = time.time()
+            # Sales No. (not NS No.) is what actually identifies a
+            # customer to the specialist, and the position number here
+            # is based on confirmed_present_sales_nos — every customer
+            # confirmed present so far, skipped or not — so it tracks
+            # this customer's real position in the app's list, rather
+            # than undercounting because earlier ones were skipped.
+            display_sales_no = _normalize_sales_no(
+                next_row.get("sales_no")) or "(no sales no)"
             print(
-                f"[{len(all_records) + 1}] Opening: {key} ({next_row.get('cust_name', '')})")
+                f"[{len(confirmed_present_sales_nos)}] Opening: {display_sales_no} ({next_row.get('cust_name', '')})")
 
             try:
                 button = next_customer["button"]
@@ -1033,7 +1576,10 @@ def run():
                 # A fresh element lookup is required here — the `button`
                 # WebElement from before driver.back() is stale now (the
                 # underlying UI tree changed), so it can't just be reused for
-                # a second tap the way it could within a single visit.
+                # a second tap the way it could within a single visit. This
+                # re-find always uses the full stable read, not the quick
+                # path — we're about to act on this exact customer, so it's
+                # exactly the case the quick path defers to it for anyway.
                 try:
                     try:
                         customers_again = get_visible_customers_stable(driver)
@@ -1078,35 +1624,123 @@ def run():
             except Exception as e:
                 print(f"  !! Skipped {key} entirely due to error: {e}")
 
-    finally:
-        driver.quit()
+            customer_elapsed = time.time() - customer_start_time
+            customer_durations.append(customer_elapsed)
+            print(f"    ({_format_duration(customer_elapsed)})")
 
-    written_to = write_output(all_records, all_ccs_rows)
-    print(f"Done. Wrote {len(all_records)} record(s) and {len(all_ccs_rows)} "
-          f"CCS Note row(s) to {written_to}")
+    except KeyboardInterrupt:
+        # Ctrl+C mid-run. Whatever's in all_records/all_ccs_rows so far
+        # still gets saved below — reached_natural_end is correctly
+        # still False here, so the "remove missing customers" logic
+        # stays safely off, same as any other partial run.
+        print("\nInterrupted (Ctrl+C) — saving whatever was captured so "
+              "far before exiting.")
+    except Exception as e:
+        # Anything unexpected (device disconnected, a selector that no
+        # longer matches, etc.) — rather than losing every customer
+        # scraped so far, save them now and surface the full traceback
+        # so the actual problem is visible, instead of just crashing
+        # silently with nothing written.
+        print(
+            f"\n!! Unexpected error, stopping early: {type(e).__name__}: {e}")
+        print("Saving whatever was captured so far before exiting.")
+        traceback.print_exc()
+    finally:
+        # driver.quit() can itself throw — most notably if the phone
+        # was physically disconnected (USB yanked, cable fault, phone
+        # rebooted) rather than the app/script hitting a normal error.
+        # In that case there's no live session left to cleanly close,
+        # and an exception raised HERE, inside finally, would propagate
+        # straight out of run() and skip everything below — including
+        # the save — which defeats the entire point of the except
+        # clauses above. Swallowing it is safe: by this point either
+        # the loop finished normally or one of the excepts above has
+        # already handled and logged the real problem.
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    total_elapsed = time.time() - run_start_time
+
+    if reached_natural_end:
+        # The full list was genuinely scanned this run, so anyone
+        # previously captured but NOT confirmed present now has actually
+        # been removed from the app — drop them from the export too,
+        # rather than leaving stale rows behind forever.
+        carried_to_keep = {sn: rec for sn, rec in carried_records.items()
+                           if sn in confirmed_present_sales_nos}
+        carried_filters_to_keep = {sn: txt for sn, txt in carried_filters.items()
+                                   if sn in confirmed_present_sales_nos}
+        removed = sorted(set(carried_records) - confirmed_present_sales_nos)
+        if removed:
+            print(f"Removed {len(removed)} customer(s) no longer found in "
+                  f"the app: {', '.join(removed)}")
+    else:
+        # Didn't confirm scanning the WHOLE list this run (LIST_LIMIT cut
+        # it short, or the safety scroll cap was hit) — "not seen yet" and
+        # "actually gone" can't be told apart from a partial scan, so
+        # nothing gets removed this time, to be safe.
+        carried_to_keep = carried_records
+        carried_filters_to_keep = carried_filters
+        if carried_records:
+            print("Note: this run didn't confirm scanning the full list "
+                  "(LIST_LIMIT or the scroll safety cap stopped it early), "
+                  "so no previously-captured customers were removed even if "
+                  "not seen this run.")
+
+    # Merge: newly-scraped customers (all_records/all_ccs_rows) plus
+    # whichever previously-captured customers are being kept (see above).
+    # These two groups never overlap by construction — a sales_no is
+    # either in known_sales_nos (skipped/carried) or it isn't (scraped
+    # fresh this run) — so a plain combine is safe.
+    merged_records = all_records + list(carried_to_keep.values())
+    merged_filters = {**carried_filters_to_keep,
+                      **_build_filters_lookup(all_ccs_rows)}
+
+    written_to = write_output(
+        merged_records, filters_override=merged_filters, app_order=sales_no_order,
+        specialist_name=name, nds_id=nds_id)
+    written_to = _finalize_output_file(written_to, reached_natural_end)
+    print(f"Done. Wrote {written_to} — {len(all_records)} newly-scraped "
+          f"customer(s), {len(carried_to_keep)} carried forward unchanged "
+          f"({len(merged_records)} total), {len(all_ccs_rows)} new CCS Note "
+          f"row(s) read.")
+    if customer_durations:
+        avg_seconds = sum(customer_durations) / len(customer_durations)
+        print(f"Total time: {_format_duration(total_elapsed)} | "
+              f"average {avg_seconds:.1f}s per NEWLY-scraped customer "
+              f"({len(customer_durations)} processed)")
+    else:
+        print(f"Total time: {_format_duration(total_elapsed)}")
 
 
 # ============================================================
 # Export column order:
-#   A=sales_no, B=appt_date, C=install_contact_person, D=install_mobile1,
-#   E=install_address, F-I=Area 1-4 (auto-filled when confident, see the
-#   "Area auto-fill" block above — you fill in the rest by hand, see
-#   _load_existing_area_values), J=proposed_date (typed by hand),
-#   K=WhatsApp Link, L=sales_info_product, M=Filters (from CCS Note
-#   data), N=WhatsApp Message, O=wa_number (hidden helper).
+#   A=sales_no, B=install_contact_person, C=install_address,
+#   D-G=Area 4-1 (Street/Locality/District-City/State — auto-filled
+#   when confident, see the "Area auto-fill" block above, you fill in
+#   the rest by hand, see _load_existing_area_values), H=appt_date,
+#   I=proposed_date (typed by hand), J=WhatsApp Link, K=WhatsApp
+#   Message, L=sales_info_product, M=Filters (from CCS Note data),
+#   N=wa_number (hidden helper). Mobile No. 1 is no longer its own
+#   visible column — the phone number still flows through internally
+#   (install_mobile1 on the record) purely to build the WhatsApp
+#   Link/Message/Number columns.
 #
 # Column letters are looked up BY NAME (see _col_letter below) rather
 # than hardcoded, precisely because this project already got bitten
 # once by a hardcoded-column-position bug after a reorder — this way
-# adding/moving a column later can't silently break a formula again.
+# adding/moving/removing a column later can't silently break a formula
+# again.
 # ============================================================
 
 ALL_COLUMNS = [
-    "Sales No.", "Appointment Date", "Installation / Service Contact Person",
-    "Mobile No. 1", "Installation / Service Address",
-    "Area 1 (State)", "Area 2 (District / City)", "Area 3 (Locality)", "Area 4 (Street)",
-    "Proposed Date", "WhatsApp Chat Link", "Product", "Filter(s)",
-    "WhatsApp Chat Message", "WhatsApp Number",
+    "Sales No.", "Installation / Service Contact Person",
+    "Installation / Service Address",
+    "Area 4 (Street)", "Area 3 (Locality)", "Area 2 (District / City)", "Area 1 (State)",
+    "Appointment Date", "Proposed Date", "WhatsApp Chat Link",
+    "WhatsApp Chat Message", "Product", "Filter(s)", "WhatsApp Number",
 ]
 
 _COLUMN_INDEX = {name: idx for idx, name in enumerate(ALL_COLUMNS, start=1)}
@@ -1114,10 +1748,19 @@ _COLUMN_INDEX = {name: idx for idx, name in enumerate(ALL_COLUMNS, start=1)}
 
 def _col_letter(column_name):
     """Excel column letter for a column, looked up by its header name —
-    e.g. _col_letter("Proposed Date") -> "J". Keeps every formula below
+    e.g. _col_letter("Proposed Date") -> "I". Keeps every formula below
     immune to column reordering."""
     from openpyxl.utils import get_column_letter
     return get_column_letter(_COLUMN_INDEX[column_name])
+
+
+def _format_duration(seconds):
+    """'93.4' -> '1m 33s'; '8.2' -> '8.2s'. Used for the per-customer and
+    total run-time output in run()."""
+    if seconds >= 60:
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes}m {secs}s"
+    return f"{seconds:.1f}s"
 
 
 def clean_phone_for_wa(raw):
@@ -1128,7 +1771,10 @@ def clean_phone_for_wa(raw):
     "60123456789"). A number that's already in some other international
     format (doesn't start with 0 after stripping) is left as digits-only
     — we can't safely guess a country code that isn't already there.
-    Returns "" if there's nothing usable.
+    Returns "" if there's nothing usable. Idempotent — running it again
+    on an already-converted number ("60123456789") leaves it unchanged,
+    which is what lets a carried-forward WhatsApp Number value safely
+    pass back through this on the next run.
     """
     digits = re.sub(r"\D", "", raw or "")
     if not digits:
@@ -1138,12 +1784,24 @@ def clean_phone_for_wa(raw):
     return digits
 
 
-def message_formula(row):
+def message_formula(row, specialist_name, nds_id):
     """
     Excel formula for one row's WhatsApp Message cell, matching the
     copywriting/formatting shown in the reference screenshot. Single
     asterisks are WhatsApp's own bold syntax, not markdown. Column
     letters are looked up by name (see _col_letter), not hardcoded.
+
+    specialist_name/nds_id come from the specialist's local identity
+    config (see _load_or_prompt_identity) and are baked into the
+    formula as literal text, not a cell reference — they're constant
+    for the whole export, not something that varies per row. Any
+    double-quote either one might contain is escaped to Excel's own
+    "" convention so it can't break the formula string.
+
+    Tarikh uses a fully Malay, all-caps date format with the weekday
+    name — e.g. "07 OKTOBER 2026 (ISNIN)" — built with
+    CHOOSE(MONTH(...)) / CHOOSE(WEEKDAY(...)) since Excel's TEXT() has
+    no built-in Malay locale to draw month/weekday names from.
 
     Note: if you copy this CELL (Ctrl+C, not double-click) and paste
     into something like Notepad, you'll see the whole value wrapped in
@@ -1164,16 +1822,24 @@ def message_formula(row):
     """
     sales_no_col = _col_letter("Sales No.")
     address_col = _col_letter("Installation / Service Address")
+    contact_col = _col_letter("Installation / Service Contact Person")
     date_col = _col_letter("Proposed Date")
     product_col = _col_letter("Product")
 
+    safe_name = (specialist_name or "").replace('"', '""')
+    safe_nds_id = (nds_id or "").replace('"', '""')
+
     tarikh_part = (
-        f'IFERROR(TEXT({date_col}{row},"DD/MM/YYYY") & " (" & '
-        f'CHOOSE(WEEKDAY({date_col}{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", {date_col}{row})'
+        f'IFERROR(TEXT({date_col}{row},"DD") & " " & '
+        f'CHOOSE(MONTH({date_col}{row}),"JANUARI","FEBRUARI","MAC","APRIL","MEI","JUN",'
+        f'"JULAI","OGOS","SEPTEMBER","OKTOBER","NOVEMBER","DISEMBER") & " " & '
+        f'TEXT({date_col}{row},"YYYY") & " (" & '
+        f'CHOOSE(WEEKDAY({date_col}{row},2),"ISNIN","SELASA","RABU","KHAMIS","JUMAAT","SABTU","AHAD") & ")", '
+        f'{date_col}{row})'
     )
     return (
-        f'=IF({date_col}{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
-        f'"Saya *Hanis*, CUCKOO+ Service Specialist (NDS35095). Saya memohon maaf jika saya menghubungi anda pada waktu yang tidak sesuai." & CHAR(10) & CHAR(10) & '
+        f'=IF({date_col}{row}="","","Selamat sejahtera Tuan/Puan " & UPPER({contact_col}{row}) & "," & CHAR(10) & CHAR(10) & '
+        f'"Saya *{safe_name}*, CUCKOO+ Service Specialist ({safe_nds_id}). Saya memohon maaf jika saya menghubungi anda pada waktu yang tidak sesuai." & CHAR(10) & CHAR(10) & '
         f'"Saya ingin mengesahkan jika saya boleh membuat lawatan servis seperti di bawah." & CHAR(10) & CHAR(10) & '
         f'"*Tarikh:* " & {tarikh_part} & CHAR(10) & '
         f'"*Alamat:* " & SUBSTITUTE({address_col}{row},CHAR(10)," ") & CHAR(10) & '
@@ -1271,7 +1937,7 @@ def _format_address_for_cell(address):
     return text
 
 
-def _populate_sheet(ws, records, filters_by_sales_no):
+def _populate_sheet(ws, records, filters_by_sales_no, specialist_name, nds_id):
     """
     Fills in headers + rows on an already-created worksheet (either a
     fresh one, or the one already inside the macro-enabled template).
@@ -1280,7 +1946,12 @@ def _populate_sheet(ws, records, filters_by_sales_no):
     the combined multi-line Filters text (see _build_filters_lookup).
     """
     FONT = "Arial"
-    header_fill = PatternFill("solid", fgColor="1F4E78")
+    # Cuckoo's own logo red is a vivid red-orange — I couldn't pull an
+    # exact official hex from their site, so this is a close visual
+    # match (a common vivid Korean-appliance-brand red). If you have
+    # the real logo file and want an exact match, this is the one
+    # value to swap.
+    header_fill = PatternFill("solid", fgColor="ED1C24")
 
     # Short, simple values read better centered; long free text (name,
     # address, filters, message) reads better left-aligned but still
@@ -1288,9 +1959,8 @@ def _populate_sheet(ws, records, filters_by_sales_no):
     # centering regardless, only horizontal centering is selective.
     CENTERED_COLUMNS = {
         _COLUMN_INDEX["Sales No."], _COLUMN_INDEX["Appointment Date"],
-        _COLUMN_INDEX["Mobile No. 1"], _COLUMN_INDEX["Proposed Date"],
-        _COLUMN_INDEX["WhatsApp Chat Link"], _COLUMN_INDEX["Product"],
-        _COLUMN_INDEX["WhatsApp Number"],
+        _COLUMN_INDEX["Proposed Date"], _COLUMN_INDEX["WhatsApp Chat Link"],
+        _COLUMN_INDEX["Product"], _COLUMN_INDEX["WhatsApp Number"],
     }
     WRAPPED_COLUMNS = {
         _COLUMN_INDEX["Installation / Service Address"],
@@ -1314,10 +1984,14 @@ def _populate_sheet(ws, records, filters_by_sales_no):
         "overwrites it. Use Excel's filter on these columns to drill "
         "down: Area 1 first, then Area 2, Area 3, Area 4 as needed."
     )
-    ws[f"{_col_letter('Area 1 (State)')}1"].comment = Comment(area_comment_text, "main.py")
-    ws[f"{_col_letter('Area 2 (District / City)')}1"].comment = Comment(area_comment_text, "main.py")
-    ws[f"{_col_letter('Area 3 (Locality)')}1"].comment = Comment(area_comment_text, "main.py")
-    ws[f"{_col_letter('Area 4 (Street)')}1"].comment = Comment(area_comment_text, "main.py")
+    ws[f"{_col_letter('Area 1 (State)')}1"].comment = Comment(
+        area_comment_text, "main.py")
+    ws[f"{_col_letter('Area 2 (District / City)')}1"].comment = Comment(
+        area_comment_text, "main.py")
+    ws[f"{_col_letter('Area 3 (Locality)')}1"].comment = Comment(
+        area_comment_text, "main.py")
+    ws[f"{_col_letter('Area 4 (Street)')}1"].comment = Comment(
+        area_comment_text, "main.py")
 
     ws[f"{_col_letter('Proposed Date')}1"].comment = Comment(
         "Type a date here (e.g. 08/08/2026 or 14 August 2026 both work) —\n"
@@ -1339,7 +2013,9 @@ def _populate_sheet(ws, records, filters_by_sales_no):
     )
     ws[f"{_col_letter('WhatsApp Number')}1"].comment = Comment(
         "Internal use only — the macro reads this to build the full "
-        "pre-filled WhatsApp link. Don't edit or delete this column.",
+        "pre-filled WhatsApp link, and it's also how the phone number "
+        "survives into next month's export now that Mobile No. 1 isn't "
+        "its own column. Don't edit or delete this column.",
         "main.py"
     )
 
@@ -1358,69 +2034,81 @@ def _populate_sheet(ws, records, filters_by_sales_no):
         return cell
 
     for row_idx, record in enumerate(records, start=2):
-        # A-E: plain scraped fields, in the specified order. Address gets
-        # one extra step (see _format_address_for_cell below) — everything
-        # else is written as-is.
-        for col_idx, field in enumerate(
-            ["sales_no", "appt_date", "install_contact_person",
-             "install_mobile1", "install_address"], start=1
-        ):
-            value = record.get(field, "")
-            if field == "install_address":
-                value = _format_address_for_cell(value)
-            set_cell(row_idx, col_idx, value)
+        set_cell(row_idx, _COLUMN_INDEX["Sales No."],
+                 record.get("sales_no", ""))
+        set_cell(row_idx, _COLUMN_INDEX["Installation / Service Contact Person"],
+                 record.get("install_contact_person", ""))
+        set_cell(row_idx, _COLUMN_INDEX["Installation / Service Address"],
+                 _format_address_for_cell(record.get("install_address", "")))
 
-        # F-I: Area 1-4 — auto-filled when confident, otherwise manual
-        # (see _load_existing_area_values / detect_areas). Whatever's
-        # already in `record` here (existing value OR fresh auto-fill)
-        # was already decided before write_output() got this far.
-        set_cell(row_idx, _COLUMN_INDEX["Area 1 (State)"], record.get("area1", ""))
-        set_cell(row_idx, _COLUMN_INDEX["Area 2 (District / City)"], record.get("area2", ""))
-        set_cell(row_idx, _COLUMN_INDEX["Area 3 (Locality)"], record.get("area3", ""))
-        set_cell(row_idx, _COLUMN_INDEX["Area 4 (Street)"], record.get("area4", ""))
+        # Area 4 -> Area 1 (Street/Locality/District-City/State) —
+        # auto-filled when confident, otherwise manual (see
+        # _load_existing_area_values / detect_areas). Whatever's already
+        # in `record` here (existing value OR fresh auto-fill) was
+        # already decided before write_output() got this far.
+        set_cell(
+            row_idx, _COLUMN_INDEX["Area 4 (Street)"], record.get("area4", ""))
+        set_cell(
+            row_idx, _COLUMN_INDEX["Area 3 (Locality)"], record.get("area3", ""))
+        set_cell(
+            row_idx, _COLUMN_INDEX["Area 2 (District / City)"], record.get("area2", ""))
+        set_cell(
+            row_idx, _COLUMN_INDEX["Area 1 (State)"], record.get("area1", ""))
 
-        # J: proposed_date — typed by hand, no special fill, displayed
-        # as "14 August 2026" regardless of how it was typed in.
-        date_cell = set_cell(row_idx, _COLUMN_INDEX["Proposed Date"], record.get("proposed_date"))
+        set_cell(row_idx, _COLUMN_INDEX["Appointment Date"],
+                 record.get("appt_date", ""))
+
+        # Proposed Date — typed by hand, no special fill, displayed as
+        # "14 August 2026" regardless of how it was typed in.
+        date_cell = set_cell(
+            row_idx, _COLUMN_INDEX["Proposed Date"], record.get("proposed_date"))
         date_cell.number_format = "d mmmm yyyy"
 
         phone_digits = clean_phone_for_wa(record.get("install_mobile1", ""))
 
-        # K: WhatsApp Chat Link (formula)
         link_cell = set_cell(row_idx, _COLUMN_INDEX["WhatsApp Chat Link"],
-                              wa_link_formula(row_idx, phone_digits))
-        link_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
+                             wa_link_formula(row_idx, phone_digits))
+        link_cell.font = Font(name=FONT, size=10,
+                              color="1155CC", underline="single")
 
-        # L: Product
-        set_cell(row_idx, _COLUMN_INDEX["Product"], record.get("sales_info_product", ""))
+        set_cell(row_idx, _COLUMN_INDEX["WhatsApp Chat Message"],
+                 message_formula(row_idx, specialist_name, nds_id))
 
-        # M: Filter(s) — combined text from CCS Note data, looked up by
+        set_cell(row_idx, _COLUMN_INDEX["Product"],
+                 record.get("sales_info_product", ""))
+
+        # Filter(s) — combined text from CCS Note data, looked up by
         # sales_no; blank if this customer had no CCS Note data captured.
-        raw_filters_text = filters_by_sales_no.get(record.get("sales_no", ""), "")
-        set_cell(row_idx, _COLUMN_INDEX["Filter(s)"], _number_filters_text(raw_filters_text))
+        raw_filters_text = filters_by_sales_no.get(
+            record.get("sales_no", ""), "")
+        set_cell(row_idx, _COLUMN_INDEX["Filter(s)"],
+                 _number_filters_text(raw_filters_text))
 
-        # N: WhatsApp Chat Message (formula)
-        set_cell(row_idx, _COLUMN_INDEX["WhatsApp Chat Message"], message_formula(row_idx))
-
-        # O: wa_number — hidden helper column, the macro (if installed)
-        # reads this directly instead of re-deriving the phone number.
-        set_cell(row_idx, _COLUMN_INDEX["WhatsApp Number"], phone_digits)
+        # WhatsApp Number — hidden helper column. The macro (if installed)
+        # reads this directly instead of re-deriving the phone number, and
+        # it's also now the only place the phone number is persisted
+        # between runs (see _load_carryforward_data). Forced to Excel's
+        # text format ('@') so re-saving/re-opening the file can't quietly
+        # convert it to a real number the way Sales No. cells could.
+        wa_number_cell = set_cell(
+            row_idx, _COLUMN_INDEX["WhatsApp Number"], phone_digits)
+        wa_number_cell.number_format = "@"
 
     widths = {
-        "Sales No.": 14, "Appointment Date": 12, "Installation / Service Contact Person": 26,
-        "Mobile No. 1": 16, "Installation / Service Address": 40,
-        "Area 1 (State)": 16, "Area 2 (District / City)": 20,
-        "Area 3 (Locality)": 22, "Area 4 (Street)": 22,
-        "Proposed Date": 14, "WhatsApp Chat Link": 18, "Product": 16,
-        "Filter(s)": 40, "WhatsApp Chat Message": 60, "WhatsApp Number": 12,
+        "Sales No.": 14, "Installation / Service Contact Person": 26,
+        "Installation / Service Address": 40,
+        "Area 4 (Street)": 22, "Area 3 (Locality)": 22,
+        "Area 2 (District / City)": 20, "Area 1 (State)": 16,
+        "Appointment Date": 12, "Proposed Date": 14,
+        "WhatsApp Chat Link": 18, "WhatsApp Chat Message": 60,
+        "Product": 16, "Filter(s)": 40, "WhatsApp Number": 12,
     }
     for name, w in widths.items():
         ws.column_dimensions[_col_letter(name)].width = w
-    ws.column_dimensions[_col_letter("WhatsApp Number")].hidden = True
-    # Row 1 AND columns through install_mobile1 (D) stay frozen — the
-    # freeze point is the cell diagonally past both. Unaffected by the
-    # Area column changes since install_address is still column E.
-    ws.freeze_panes = "E2"
+    # Header row AND the first two columns (Sales No., Installation /
+    # Service Contact Person) stay frozen — the freeze point is the cell
+    # diagonally past both, i.e. the first cell of column C.
+    ws.freeze_panes = "C2"
 
 
 def _build_filters_lookup(ccs_rows):
@@ -1433,7 +2121,8 @@ def _build_filters_lookup(ccs_rows):
     """
     by_customer = {}
     for r in ccs_rows:
-        by_customer.setdefault(r["sales_no"], []).append((r["product"], r["last_change"]))
+        by_customer.setdefault(r["sales_no"], []).append(
+            (r["product"], r["last_change"]))
 
     lookup = {}
     for sales_no, filters in by_customer.items():
@@ -1443,7 +2132,6 @@ def _build_filters_lookup(ccs_rows):
             for product, last_change in filters_sorted
         )
     return lookup
-
 
 
 def clean_text(value):
@@ -1482,10 +2170,10 @@ def _load_existing_area_values():
     existed (in which case everything auto-fills fresh, same as a
     first-ever run).
     """
-    target_file = OUTPUT_FILE_XLSM if os.path.exists(OUTPUT_FILE_XLSM) else (
-        OUTPUT_FILE if os.path.exists(OUTPUT_FILE) else None)
+    target_file = CARRYFORWARD_SOURCE_FILE
     if not target_file:
         return {}
+    wb = None
     try:
         wb = openpyxl.load_workbook(target_file, data_only=False)
         ws = wb.active
@@ -1504,7 +2192,8 @@ def _load_existing_area_values():
 
         existing = {}
         for row_idx in range(2, ws.max_row + 1):
-            sales_no = ws.cell(row=row_idx, column=sales_no_col).value
+            sales_no = _normalize_sales_no(
+                ws.cell(row=row_idx, column=sales_no_col).value)
             if not sales_no:
                 continue
             values = {}
@@ -1519,6 +2208,14 @@ def _load_existing_area_values():
         print(f"  !! Could not read existing Area values from {target_file} "
               f"({e}) — starting fresh for all customers.")
         return {}
+    finally:
+        # Always closed explicitly here, on our own terms, instead of
+        # leaving it to Python's garbage collector — relying on GC timing
+        # for this is what causes the harmless-but-noisy "Exception
+        # ignored...ValueError: I/O operation on closed file" warning
+        # some Python versions print at interpreter shutdown.
+        if wb is not None:
+            wb.close()
 
 
 def build_vba_macro():
@@ -1527,8 +2224,8 @@ def build_vba_macro():
     positions (same _col_letter/_COLUMN_INDEX lookups as everything
     else) — this is what makes the macro immune to going stale after a
     future column reorder, which is exactly what broke it last time (it
-    was hardcoded to column H/8 for the WhatsApp Link, and drifted out
-    of sync when Area 1-4 pushed that column to K/11).
+    was hardcoded to a fixed column for the WhatsApp Link, and drifted
+    out of sync once the columns were reordered).
 
     Run `python main.py --show-macro` any time you need a fresh, correct
     copy — safer than trusting a copy/pasted version to still be right.
@@ -1559,13 +2256,62 @@ def build_vba_macro():
     )
 
 
-def write_output(records, ccs_rows=None, filters_override=None):
+def _load_existing_proposed_dates():
+    """
+    Reads the Proposed Date column back from whichever export file
+    already exists, keyed by sales_no. Mirrors _load_existing_area_values
+    exactly, for the exact same reason: without this, a typed-in
+    Proposed Date gets silently wiped back to blank every time the
+    script is run again (confirmed by testing — re-running after new
+    customers appear in the app was blanking out dates already entered
+    for existing ones, since a fresh scrape has no way to know what you
+    typed in Excel afterward). Returns {} if no export file exists yet,
+    or if it's from before this column existed.
+    """
+    target_file = CARRYFORWARD_SOURCE_FILE
+    if not target_file:
+        return {}
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(target_file, data_only=False)
+        ws = wb.active
+        header_row = [c.value for c in ws[1]]
+        if "Sales No." not in header_row or "Proposed Date" not in header_row:
+            return {}
+        sales_no_col = header_row.index("Sales No.") + 1
+        date_col = header_row.index("Proposed Date") + 1
+
+        existing = {}
+        for row_idx in range(2, ws.max_row + 1):
+            sales_no = _normalize_sales_no(
+                ws.cell(row=row_idx, column=sales_no_col).value)
+            date_val = ws.cell(row=row_idx, column=date_col).value
+            if sales_no and date_val:
+                existing[sales_no] = date_val
+        return existing
+    except Exception as e:
+        print(f"  !! Could not read existing Proposed Date values from "
+              f"{target_file} ({e}) — starting fresh for all customers.")
+        return {}
+    finally:
+        if wb is not None:
+            wb.close()
+
+
+def write_output(records, ccs_rows=None, filters_override=None, app_order=None,
+                 specialist_name="Hanis", nds_id="NDS35095"):
     """
     Writes the export with the columns in the order specified at the
-    top of this section (sales_no, appt_date, install_contact_person,
-    install_mobile1, install_address, Area, proposed_date, WhatsApp
-    Link, sales_info_product, Filters, WhatsApp Message, wa_number) —
-    all in ONE sheet, no separate CCS Notes/Route Plan sheet.
+    top of this section (sales_no, install_contact_person,
+    install_address, Area 4-1, appt_date, proposed_date, WhatsApp Link,
+    WhatsApp Message, sales_info_product, Filters, wa_number) — all in
+    ONE sheet, no separate CCS Notes/Route Plan sheet.
+
+    specialist_name/nds_id feed straight into message_formula() — see
+    its docstring — so every caller should really be passing the
+    values from _load_or_prompt_identity() rather than relying on
+    these defaults, which only exist so this function still works if
+    called without them.
 
     Area 1-4 auto-fill when the script is confident (free, offline
     postcode + keyword matching — see the "Area auto-fill" block near
@@ -1577,7 +2323,7 @@ def write_output(records, ccs_rows=None, filters_override=None):
 
     TWO POSSIBLE OUTPUTS, chosen automatically:
 
-    1. If TEMPLATE_FILE ("cuckoo_export_template.xlsm") exists, this
+    1. If TEMPLATE_FILE ("macro.xlsm") exists, this
        writes INTO a copy of it (loaded with keep_vba=True so its
        macro survives) and saves as OUTPUT_FILE_XLSM. In that file,
        double-clicking a WhatsApp Link cell runs the macro, which opens
@@ -1593,13 +2339,12 @@ def write_output(records, ccs_rows=None, filters_override=None):
     ONE-TIME SETUP for option 1 (only needs doing once, ever —
     openpyxl can't write compiled VBA itself, so this part is manual).
     IMPORTANT: if you already pasted an earlier version of this macro
-    (from before Area 1-4 were added), it's now WRONG — it was checking
-    column H/8 for the WhatsApp Link, which shifted to K/11 when those
-    columns were inserted, so double-clicking silently did nothing.
-    Replace it with the version below (or, safer: run
-    `python main.py --show-macro` any time to print a version that's
-    guaranteed correct for the CURRENT column layout, rather than
-    trusting this docstring to stay in sync after a future change).
+    (from before a column reorder), it's now WRONG — the column
+    letters below match the CURRENT layout at the time this docstring
+    was last written, but the safest option is always to run
+    `python main.py --show-macro` and paste whatever it prints, since
+    that's generated fresh from the current column layout every time
+    rather than relying on this text staying in sync.
       a. Run the script once normally so a plain cuckoo_export.xlsx
          exists with the columns/formulas already in it.
       b. Open that file in Excel. Press Alt+F11 to open the VBA editor.
@@ -1611,11 +2356,11 @@ def write_output(records, ccs_rows=None, filters_override=None):
 
            Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
                Dim r As Long, num As String, msg As String, url As String
-               If Target.Column <> 11 Then Exit Sub   ' column K = WhatsApp Chat Link
+               If Target.Column <> 9 Then Exit Sub   ' column I = WhatsApp Chat Link
                r = Target.Row
                If r < 2 Then Exit Sub
-               num = Trim(Cells(r, "O").Value)       ' hidden helper column
-               msg = Cells(r, "N").Value              ' WhatsApp Chat Message
+               num = Trim(Cells(r, "M").Value)       ' hidden helper column
+               msg = Cells(r, "J").Value              ' WhatsApp Chat Message
                If num = "" Or msg = "" Then Exit Sub
                ' web.whatsapp.com (not wa.me) on purpose — wa.me links often
                ' get intercepted by WhatsApp Desktop if it's installed, and
@@ -1629,9 +2374,9 @@ def write_output(records, ccs_rows=None, filters_override=None):
            End Sub
 
       e. Close the VBA editor. File > Save As > "Excel Macro-Enabled
-         Workbook (*.xlsm)" > save it as exactly
-         "cuckoo_export_template.xlsm", in the same folder this script
-         runs from.
+         Workbook (*.xlsm)" > save it as exactly "macro.xlsm", in the
+         project's root folder (next to this script — NOT inside any
+         of the per-person NDS-ID/name export folders).
       f. From then on, every run of this script detects that file and
          writes into it automatically — this setup never needs
          repeating (unless the columns change again).
@@ -1642,7 +2387,8 @@ def write_output(records, ccs_rows=None, filters_override=None):
         print("No records captured — nothing written.")
         return OUTPUT_FILE
 
-    records = sorted(records, key=lambda r: r.get("sales_no", ""))
+    for r in records:
+        r["sales_no"] = _normalize_sales_no(r.get("sales_no"))
 
     # Area 1-4: for each customer, whatever's already in the existing
     # file (typed by hand OR auto-filled on an earlier run) always wins
@@ -1650,7 +2396,8 @@ def write_output(records, ccs_rows=None, filters_override=None):
     # been filled before gets a fresh auto-fill attempt from
     # detect_areas() — and even then, only the specific area1/2/3/4
     # fields it's confident about get filled; the rest stay blank for
-    # you to fill in by hand, same as before.
+    # you to fill in by hand, same as before. This has to happen BEFORE
+    # sorting below, since the sort is now based on these values.
     existing_area_values = _load_existing_area_values()
     for r in records:
         existing = existing_area_values.get(r.get("sales_no", ""), {})
@@ -1658,7 +2405,52 @@ def write_output(records, ccs_rows=None, filters_override=None):
         for field in ("area1", "area2", "area3", "area4"):
             r[field] = existing.get(field) or auto.get(field, "")
 
-    filters_by_sales_no = filters_override if filters_override is not None else _build_filters_lookup(ccs_rows)
+    # Proposed Date: same protection as Area 1-4 above — a customer's
+    # already-typed date always wins over a fresh (blank) scrape value.
+    # A truly new customer has nothing here yet, so it just stays blank
+    # for you to fill in, same as before.
+    existing_proposed_dates = _load_existing_proposed_dates()
+    for r in records:
+        existing_date = existing_proposed_dates.get(r.get("sales_no", ""))
+        if existing_date:
+            r["proposed_date"] = existing_date
+
+    # Sort: primarily by Area 1 -> Area 2 -> Area 3 -> Area 4, grouping
+    # customers by location as closely as the auto-fill/manual data
+    # allows — this is the actual point of having Area columns at all,
+    # so the finished sheet should reflect it directly, not just leave
+    # grouping to Excel's filter dropdowns. A blank value at any level
+    # sorts AFTER a real value at that same level, so fully-categorized
+    # rows cluster together and the ones still needing attention (blank
+    # Area) end up together too, easy to spot.
+    #
+    # Within an identical Area 1-4 combination (very common — e.g. every
+    # "blank/blank/blank/blank" new customer, or several people in the
+    # same precinct), the tiebreaker is app_order if the caller supplied
+    # one (run() does, from the order customers were actually encountered
+    # scrolling through the app this run — which can genuinely differ
+    # from any previous export's order) — falling back to Sales No. for
+    # a caller that didn't supply one (e.g. --resort).
+    app_order_lookup = {sn: idx for idx,
+                        sn in enumerate(app_order)} if app_order else {}
+
+    def _area_sort_key(r):
+        def level(value):
+            return (1, "") if not value else (0, value)
+        sales_no = r.get("sales_no", "")
+        return (
+            level(r.get("area1", "")),
+            level(r.get("area2", "")),
+            level(r.get("area3", "")),
+            level(r.get("area4", "")),
+            app_order_lookup.get(sales_no, len(app_order_lookup)),
+            sales_no,
+        )
+
+    records = sorted(records, key=_area_sort_key)
+
+    filters_by_sales_no = filters_override if filters_override is not None else _build_filters_lookup(
+        ccs_rows)
 
     if os.path.exists(TEMPLATE_FILE):
         try:
@@ -1668,8 +2460,10 @@ def write_output(records, ccs_rows=None, filters_override=None):
             # but leave row 1 (headers) and the macro itself untouched.
             if ws.max_row > 1:
                 ws.delete_rows(2, ws.max_row - 1)
-            _populate_sheet(ws, records, filters_by_sales_no)
+            _populate_sheet(ws, records, filters_by_sales_no,
+                            specialist_name, nds_id)
             wb.save(OUTPUT_FILE_XLSM)
+            wb.close()
             return OUTPUT_FILE_XLSM
         except Exception as e:
             print(f"  !! Could not write into {TEMPLATE_FILE} ({e}) — "
@@ -1678,78 +2472,108 @@ def write_output(records, ccs_rows=None, filters_override=None):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cuckoo Export"
-    _populate_sheet(ws, records, filters_by_sales_no)
+    _populate_sheet(ws, records, filters_by_sales_no, specialist_name, nds_id)
     wb.save(OUTPUT_FILE)
+    wb.close()
     return OUTPUT_FILE
 
 
 def resort_existing_file():
     """
     Preview/rebuild mode: `python main.py --resort`. Reads whichever
-    export file already exists (from a previous full scrape — no
-    device/Appium needed here at all) and rewrites it fresh: same
-    sales_no sort, same Area values, same proposed_date and Filters
-    text, but formulas/formatting regenerated from scratch. Useful for
-    e.g. picking up a formatting change without a full re-scrape.
+    export file already exists for this specialist+month (from a
+    previous full scrape — no device/Appium needed here at all) and
+    rewrites it fresh: same sales_no sort, same Area values, same
+    proposed_date and Filters text, but formulas/formatting
+    regenerated from scratch. Useful for e.g. picking up a formatting
+    change without a full re-scrape.
+
+    Unlike a normal run(), this does NOT bump the version number in
+    the filename — it's a formatting refresh of the CURRENT latest
+    version, not a new capture, so it rewrites that exact file in
+    place.
 
     proposed_date, Area, and the Filters text are all read back from
     the existing file and carried over untouched (Area gets carried
     over automatically by write_output() itself, same as a normal run
-    — see _load_existing_areas()).
+    — see _load_existing_area_values()).
     """
-    target_file = OUTPUT_FILE_XLSM if os.path.exists(OUTPUT_FILE_XLSM) else (
-        OUTPUT_FILE if os.path.exists(OUTPUT_FILE) else None)
+    global OUTPUT_FILE, OUTPUT_FILE_XLSM
+
+    name, nds_id = _load_or_prompt_identity()
+    month_label = _prompt_month_label()
+    # This also sets CARRYFORWARD_SOURCE_FILE to the current latest
+    # version file (if any) — the OUTPUT_FILE/OUTPUT_FILE_XLSM it
+    # computes are the NEXT version, which is overridden below since
+    # --resort must not bump the version.
+    _apply_identity_to_filenames(name, nds_id, month_label)
+
+    target_file = CARRYFORWARD_SOURCE_FILE
     if not target_file:
-        print(f"Couldn't find {OUTPUT_FILE_XLSM} or {OUTPUT_FILE} — "
-              f"run main.py normally at least once first.")
+        print(f"Couldn't find an existing export for {name} ({nds_id}) in "
+              f"{month_label} — run main.py normally at least once first.")
         return
+
+    if target_file.endswith(".xlsm"):
+        OUTPUT_FILE_XLSM = target_file
+        OUTPUT_FILE = target_file[:-len(".xlsm")] + ".xlsx"
+    else:
+        OUTPUT_FILE = target_file
+        OUTPUT_FILE_XLSM = target_file[:-len(".xlsx")] + ".xlsm"
 
     wb = openpyxl.load_workbook(target_file, data_only=False)
-    ws = wb.active
+    try:
+        ws = wb.active
 
-    # Read by HEADER NAME, not fixed column number — this is the actual
-    # fix for a real bug: an existing file from an older layout (before
-    # a column reorder) was being read with the CURRENT layout's fixed
-    # positions, silently pulling data from the wrong columns entirely
-    # (e.g. Filters' old position ending up mislabeled as
-    # sales_info_product). Reading by name means this can't happen
-    # again even if columns get reordered in the future.
-    header_row = [c.value for c in ws[1]]
-    col = {name: idx + 1 for idx, name in enumerate(header_row) if name}
+        # Read by HEADER NAME, not fixed column number — this is the actual
+        # fix for a real bug: an existing file from an older layout (before
+        # a column reorder) was being read with the CURRENT layout's fixed
+        # positions, silently pulling data from the wrong columns entirely
+        # (e.g. Filters' old position ending up mislabeled as
+        # sales_info_product). Reading by name means this can't happen
+        # again even if columns get reordered in the future.
+        header_row = [c.value for c in ws[1]]
+        col = {col_name: idx + 1 for idx,
+               col_name in enumerate(header_row) if col_name}
 
-    required = ["Sales No.", "Appointment Date", "Installation / Service Contact Person",
-                "Mobile No. 1", "Installation / Service Address", "Proposed Date",
-                "Product", "Filter(s)"]
-    missing = [name for name in required if name not in col]
-    if missing:
-        print(f"  !! {target_file}'s header row is missing {missing} — "
-              f"it looks like it's from a very different version of this "
-              f"script. Run main.py normally (a full scrape) to regenerate "
-              f"it in the current layout, then --resort will work again.")
-        return
+        required = ["Sales No.", "Appointment Date", "Installation / Service Contact Person",
+                    "Installation / Service Address", "Proposed Date",
+                    "Product", "Filter(s)", "WhatsApp Number"]
+        missing = [name for name in required if name not in col]
+        if missing:
+            print(f"  !! {target_file}'s header row is missing {missing} — "
+                  f"it looks like it's from a very different version of this "
+                  f"script. Run main.py normally (a full scrape) to regenerate "
+                  f"it in the current layout, then --resort will work again.")
+            return
 
-    records = []
-    filters_by_sales_no = {}
-    for row_idx in range(2, ws.max_row + 1):
-        sales_no = ws.cell(row=row_idx, column=col["Sales No."]).value
-        if not sales_no:
-            continue
-        records.append({
-            "sales_no": sales_no,
-            "appt_date": ws.cell(row=row_idx, column=col["Appointment Date"]).value or "",
-            "install_contact_person": ws.cell(row=row_idx, column=col["Installation / Service Contact Person"]).value or "",
-            "install_mobile1": ws.cell(row=row_idx, column=col["Mobile No. 1"]).value or "",
-            "install_address": ws.cell(row=row_idx, column=col["Installation / Service Address"]).value or "",
-            "proposed_date": ws.cell(row=row_idx, column=col["Proposed Date"]).value,
-            "sales_info_product": ws.cell(row=row_idx, column=col["Product"]).value or "",
-        })
-        filters_text = ws.cell(row=row_idx, column=col["Filter(s)"]).value
-        if filters_text:
-            filters_by_sales_no[sales_no] = filters_text
+        records = []
+        filters_by_sales_no = {}
+        for row_idx in range(2, ws.max_row + 1):
+            sales_no = _normalize_sales_no(
+                ws.cell(row=row_idx, column=col["Sales No."]).value)
+            if not sales_no:
+                continue
+            records.append({
+                "sales_no": sales_no,
+                "appt_date": ws.cell(row=row_idx, column=col["Appointment Date"]).value or "",
+                "install_contact_person": ws.cell(row=row_idx, column=col["Installation / Service Contact Person"]).value or "",
+                "install_mobile1": _normalize_phone_digits(
+                    ws.cell(row=row_idx, column=col["WhatsApp Number"]).value),
+                "install_address": ws.cell(row=row_idx, column=col["Installation / Service Address"]).value or "",
+                "proposed_date": ws.cell(row=row_idx, column=col["Proposed Date"]).value,
+                "sales_info_product": ws.cell(row=row_idx, column=col["Product"]).value or "",
+            })
+            filters_text = ws.cell(row=row_idx, column=col["Filter(s)"]).value
+            if filters_text:
+                filters_by_sales_no[sales_no] = filters_text
+    finally:
+        wb.close()
 
     print(f"Rebuilding {len(records)} existing record(s) from {target_file} "
           f"(no device/Appium needed for this)...")
-    write_output(records, filters_override=filters_by_sales_no)
+    write_output(records, filters_override=filters_by_sales_no,
+                 specialist_name=name, nds_id=nds_id)
 
 
 if __name__ == "__main__":
