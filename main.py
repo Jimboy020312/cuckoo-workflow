@@ -115,7 +115,7 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = None   # was 3 for testing — now processes the whole list
+LIST_g = None   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
 DEBUG = False
 

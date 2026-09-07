@@ -1,4 +1,9 @@
 venv/
+
 __pycache__/
 *.pyc
-cuckoo_export.xlsm
+
+.xlsx
+
+*.xlsm
+!macro.xlsm
