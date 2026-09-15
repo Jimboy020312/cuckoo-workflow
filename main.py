@@ -136,17 +136,24 @@ REQUIRED_LIST_FIELDS = set(LABEL_FIELD_MAP.values())
 # edge, not actually incomplete data
 
 # --- Detail screen: Address/Contact Info tab (confirmed from XML) ---
-BILLING_LABEL_MAP = {
-    "Doc No.": "billing_doc_no",
-    "Sales No.": "billing_sales_no",
-    "Contact Person": "billing_contact_person",
-    "Tel No (Mobile 1)": "billing_mobile1",
-    "Tel No (Mobile 2)": "billing_mobile2",
-    "Tel No (Office)": "billing_office_phone",
-    "Email": "billing_email",
-}
-BILLING_ORPHAN_FIELDS = ["billing_customer_name",
-                         "billing_ic_number", "billing_address"]
+#
+# NOTE: this screen also has a "Billing Address & Contact" section and
+# an "Emergency Contact" section, both fully labeled/parseable the same
+# way as everything else here — but neither one is scraped anymore.
+# Verified by cross-referencing every field this script could produce
+# against every place it's actually read downstream: nothing in the
+# export, in carry-forward, or anywhere else ever reads a billing_* or
+# emergency_* field. Scraping them cost two full extra device round
+# trips per newly-scraped customer (get_billing_elements() and
+# get_emergency_elements() each did their own wait_for + find_elements)
+# for data that went nowhere. Cut for real runtime savings, with zero
+# risk to anything actually used — if this data is ever needed again,
+# the original label maps are straightforward to recreate from the
+# same XML captures (Doc No./Sales No./Contact Person/Tel No (Mobile
+# 1)/Tel No (Mobile 2)/Tel No (Office)/Email for Billing, keyed
+# "billing_*"; Contact Name/Contact Number/Relation for Emergency,
+# keyed "emergency_*"), following the same pattern INSTALL_LABEL_MAP
+# below still uses.
 
 INSTALL_LABEL_MAP = {
     "Contact Person": "install_contact_person",
@@ -158,17 +165,14 @@ INSTALL_LABEL_MAP = {
 }
 INSTALL_ORPHAN_FIELDS = ["install_address"]
 
-EMERGENCY_LABEL_MAP = {
-    "Contact Name": "emergency_contact_name",
-    "Contact Number": "emergency_contact_number",
-    "Relation": "emergency_relation",
-}
-
-HEADER_TEXTS = {
-    "Billing Address & Contact",
-    "Installation/Service Address & Contact",
-    "Emergency Contact",
-}
+# Only the Installation/Service section's own header needs skipping —
+# pair_fields() is only ever called for THIS section now (Billing/
+# Emergency are no longer scraped, see the note above), and
+# get_installation_elements()'s XPath includes this header text as one
+# of the TextViews it returns (it's a descendant of the section's own
+# parent ViewGroup), so it has to be filtered out or it'd be
+# misread as an orphan field.
+HEADER_TEXTS = {"Installation/Service Address & Contact"}
 
 # --- Detail screen: Sales Info tab (confirmed from XML) ---
 SALES_INFO_LABEL_MAP = {
@@ -225,6 +229,34 @@ SCROLL_REGION_HEIGHT_FRACTION = 0.48
 # testing without hunting through the function — just watch for
 # misreads (skipped/duplicated customers) if you push it much lower.
 SCROLL_SETTLE_SECONDS = 0.6
+
+# --- Settle-time tuning telemetry ---
+# get_visible_customers_stable() waits for two consecutive matching
+# reads before trusting the screen (see its own docstring) — if the
+# very first read is already stable, that's 1 "attempt". If the screen
+# hadn't finished rendering yet, it takes 2+ attempts, each one costing
+# an extra settle_delay wait. These three counters track how often that
+# happens across a whole run, purely so SCROLL_SETTLE_SECONDS can be
+# tuned from real evidence instead of a guess — see the summary printed
+# at the end of run() (search "Screen-settle check" below).
+#
+# Why this matters even though get_visible_customers_stable() already
+# protects itself: get_visible_customers_quick_or_stable() — the FAST
+# path used for most customers in a normal run, since most are already
+# known — does exactly ONE read with no retry at all. It has no safety
+# net of its own. These counters don't measure the quick path directly
+# (it wouldn't have anything meaningful to count, by design), but they
+# ARE a proxy for it: if the careful, self-correcting path is
+# frequently needing 2+ attempts to get a stable read at the current
+# SCROLL_SETTLE_SECONDS, that means this phone's rendering is already
+# close to that time limit — which means the fast path (with no retry
+# to fall back on) is riding on a thin margin too. A run where the
+# average stays at (or very near) 1.00 is real evidence there's slack
+# to lower SCROLL_SETTLE_SECONDS a bit; an average noticeably above
+# 1.00 is a sign NOT to lower it further, and possibly to raise it.
+_STABLE_READ_TOTAL_CALLS = 0
+_STABLE_READ_TOTAL_ATTEMPTS = 0
+_STABLE_READ_GAVE_UP_COUNT = 0
 
 
 # ============================================================
@@ -676,15 +708,25 @@ def get_visible_customers_stable(driver, max_attempts=4, settle_delay=0.4):
     number. Waiting for two matching reads in a row avoids trusting a
     transitional, half-updated state.
     """
+    global _STABLE_READ_TOTAL_CALLS, _STABLE_READ_TOTAL_ATTEMPTS, _STABLE_READ_GAVE_UP_COUNT
+
     prev_signature = None
     customers = []
-    for _ in range(max_attempts):
+    _STABLE_READ_TOTAL_CALLS += 1
+    for attempt_num in range(1, max_attempts + 1):
         customers = get_visible_customers(driver)
         signature = tuple(c["row"].get(KEY_FIELD, "") for c in customers)
         if signature == prev_signature and signature:
+            _STABLE_READ_TOTAL_ATTEMPTS += attempt_num
             return customers
         prev_signature = signature
         time.sleep(settle_delay)
+    # Never got two matching reads in a row within max_attempts — the
+    # screen genuinely wouldn't settle this time. Counted separately
+    # from the normal attempt tally since this is a stronger signal
+    # than "needed a retry" — it's "retrying didn't even help."
+    _STABLE_READ_TOTAL_ATTEMPTS += max_attempts
+    _STABLE_READ_GAVE_UP_COUNT += 1
     return customers
 
 
@@ -738,32 +780,12 @@ def select_popup_option(driver, option_text, timeout=WAIT_SECONDS):
 # Detail screen: Address/Contact Info tab
 # ============================================================
 
-def get_billing_elements(driver):
-    wait_for(driver, (AppiumBy.XPATH,
-             '//android.widget.TextView[@text="Billing Address & Contact"]'))
-    return driver.find_elements(
-        AppiumBy.XPATH,
-        '//android.widget.TextView[@text="Billing Address & Contact"]'
-        '/following-sibling::android.view.ViewGroup[1]//android.widget.TextView'
-    )
-
-
 def get_installation_elements(driver):
     wait_for(driver, (AppiumBy.XPATH,
              '//android.widget.TextView[@text="Installation/Service Address & Contact"]'))
     return driver.find_elements(
         AppiumBy.XPATH,
         '//android.widget.TextView[@text="Installation/Service Address & Contact"]'
-        '/parent::android.view.ViewGroup//android.widget.TextView'
-    )
-
-
-def get_emergency_elements(driver):
-    wait_for(driver, (AppiumBy.XPATH,
-             '//android.widget.TextView[@text="Emergency Contact"]'))
-    return driver.find_elements(
-        AppiumBy.XPATH,
-        '//android.widget.TextView[@text="Emergency Contact"]'
         '/parent::android.view.ViewGroup//android.widget.TextView'
     )
 
@@ -778,16 +800,9 @@ def read_full_detail(driver):
     record = {}
 
     # --- Address/Contact Info tab (shown by default) ---
-    billing_row, billing_orphans = pair_fields(
-        get_billing_elements(driver),
-        known_labels=set(BILLING_LABEL_MAP.keys()), skip_texts=HEADER_TEXTS
-    )
-    for label_text, field_name in BILLING_LABEL_MAP.items():
-        record[field_name] = billing_row.get(label_text, "")
-    for i, field_name in enumerate(BILLING_ORPHAN_FIELDS):
-        record[field_name] = billing_orphans[i] if i < len(
-            billing_orphans) else ""
-
+    # Billing Address & Contact and Emergency Contact are NOT scraped
+    # here (see the note above INSTALL_LABEL_MAP) — only the
+    # Installation/Service section is actually used downstream.
     install_row, install_orphans = pair_fields(
         get_installation_elements(driver),
         known_labels=set(INSTALL_LABEL_MAP.keys()), skip_texts=HEADER_TEXTS
@@ -797,13 +812,6 @@ def read_full_detail(driver):
     for i, field_name in enumerate(INSTALL_ORPHAN_FIELDS):
         record[field_name] = install_orphans[i] if i < len(
             install_orphans) else ""
-
-    emergency_row, _ = pair_fields(
-        get_emergency_elements(driver),
-        known_labels=set(EMERGENCY_LABEL_MAP.keys()), skip_texts=HEADER_TEXTS
-    )
-    for label_text, field_name in EMERGENCY_LABEL_MAP.items():
-        record[field_name] = emergency_row.get(label_text, "")
 
     # --- Switch to Sales Info tab ---
     sales_tab = wait_for(
@@ -1718,7 +1726,7 @@ def run():
 # ============================================================
 # Export column order:
 #   A=sales_no, B=install_contact_person, C=install_address,
-#   D-G=Area 4-1 (Street/Locality/District-City/State — auto-filled
+#   D-G=Area 1-4 (State/District-City/Locality/Street — auto-filled
 #   when confident, see the "Area auto-fill" block above, you fill in
 #   the rest by hand, see _load_existing_area_values), H=appt_date,
 #   I=proposed_date (typed by hand), J=WhatsApp Link, K=WhatsApp
@@ -1738,7 +1746,7 @@ def run():
 ALL_COLUMNS = [
     "Sales No.", "Installation / Service Contact Person",
     "Installation / Service Address",
-    "Area 4 (Street)", "Area 3 (Locality)", "Area 2 (District / City)", "Area 1 (State)",
+    "Area 1 (State)", "Area 2 (District / City)", "Area 3 (Locality)", "Area 4 (Street)",
     "Appointment Date", "Proposed Date", "WhatsApp Chat Link",
     "WhatsApp Chat Message", "Product", "Filter(s)", "WhatsApp Number",
 ]
@@ -2041,19 +2049,19 @@ def _populate_sheet(ws, records, filters_by_sales_no, specialist_name, nds_id):
         set_cell(row_idx, _COLUMN_INDEX["Installation / Service Address"],
                  _format_address_for_cell(record.get("install_address", "")))
 
-        # Area 4 -> Area 1 (Street/Locality/District-City/State) —
+        # Area 1 -> Area 4 (State/District-City/Locality/Street) —
         # auto-filled when confident, otherwise manual (see
         # _load_existing_area_values / detect_areas). Whatever's already
         # in `record` here (existing value OR fresh auto-fill) was
         # already decided before write_output() got this far.
         set_cell(
-            row_idx, _COLUMN_INDEX["Area 4 (Street)"], record.get("area4", ""))
-        set_cell(
-            row_idx, _COLUMN_INDEX["Area 3 (Locality)"], record.get("area3", ""))
+            row_idx, _COLUMN_INDEX["Area 1 (State)"], record.get("area1", ""))
         set_cell(
             row_idx, _COLUMN_INDEX["Area 2 (District / City)"], record.get("area2", ""))
         set_cell(
-            row_idx, _COLUMN_INDEX["Area 1 (State)"], record.get("area1", ""))
+            row_idx, _COLUMN_INDEX["Area 3 (Locality)"], record.get("area3", ""))
+        set_cell(
+            row_idx, _COLUMN_INDEX["Area 4 (Street)"], record.get("area4", ""))
 
         set_cell(row_idx, _COLUMN_INDEX["Appointment Date"],
                  record.get("appt_date", ""))
@@ -2632,6 +2640,20 @@ def export_contacts():
     Customers with no usable phone number (WhatsApp Number column is
     blank) are skipped entirely, since an empty TEL field would just
     create a useless, unreachable contact.
+
+    IMPORTANT — before importing this file, DELETE any "NDS | ..."
+    contacts already on the phone from a previous import first. vCard
+    import is purely additive: it doesn't check for existing contacts,
+    so importing the same file (or a newer month's file) on top of an
+    old import without deleting first causes either duplicate contacts
+    (same customer imported twice) or stale contacts left behind (a
+    customer who's no longer in this month's list, but whose old
+    contact never gets removed just because a new file was imported).
+    Search "NDS" in Contacts (or contacts.google.com on desktop, if the
+    phone syncs to Google), select all, delete — then import the fresh
+    .vcf. Since every contact this script creates starts with the same
+    "NDS |" prefix, that search reliably catches all of them and
+    nothing else.
     """
     name, nds_id = _load_or_prompt_identity()
     month_label = _prompt_month_label()
@@ -2682,10 +2704,28 @@ def export_contacts():
 
             display_name = (f"NDS | {contact_person} ({sales_no})"
                             if contact_person else f"NDS | {sales_no}")
+            safe_name = _vcard_escape(display_name)
             vcards.append(
                 "BEGIN:VCARD\r\n"
                 "VERSION:3.0\r\n"
-                f"FN:{_vcard_escape(display_name)}\r\n"
+                f"FN:{safe_name}\r\n"
+                # N (structured name) is REQUIRED by the vCard 3.0 spec
+                # alongside FN, even though FN alone is enough to display
+                # a name. Android's contacts importer is lenient and
+                # accepts FN with no N at all — this file worked fine
+                # there. iOS's importer is strict: when it hits a vCard
+                # missing N partway through a multi-contact file, it
+                # chokes and silently stops, showing only whatever it
+                # managed to parse before the failure (confirmed: this
+                # exact symptom — only the first contact ever showing up,
+                # across WhatsApp, Mail, and Files — is a documented iOS
+                # vCard failure mode, not a fluke of any one app). Since
+                # the name isn't split into first/last name components
+                # here, the whole display name goes into N's first
+                # component (family name) and the rest are left blank —
+                # that's enough to satisfy the requirement without
+                # inventing a fake name split.
+                f"N:{safe_name};;;;\r\n"
                 f"TEL;TYPE=CELL:{phone_digits}\r\n"
                 "END:VCARD\r\n"
             )
