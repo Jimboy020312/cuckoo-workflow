@@ -470,7 +470,21 @@ def scroll_down(driver, percent=None):
         "percent": percent,
     })
     time.sleep(SCROLL_SETTLE_SECONDS)
-    dismiss_keyboard_if_present(driver)
+    # DISABLED (not deleted) — this was a defensive check for a scroll
+    # gesture accidentally landing on the list screen's pinned "NS
+    # Number."/"Sales No." search boxes and popping the keyboard, which
+    # would throw off every element's y-coordinate for the row-grouping
+    # logic elsewhere in this file. Confirmed it's never actually
+    # triggered in real runs, and this script currently only ever runs
+    # on one known device — so the extra Appium round trip on every
+    # single scroll (there are a LOT of these across a full run,
+    # especially inside the CCS Note scrolling loop) isn't buying
+    # anything right now. If this ever runs on a DIFFERENT phone
+    # (different screen size/pinned-header height — e.g. if a
+    # colleague starts using this), that's exactly the situation this
+    # was guarding against, so re-enable it first: just uncomment the
+    # line below.
+    # dismiss_keyboard_if_present(driver)
 
 
 def compute_scroll_percent(driver, target_top_y, margin_fraction=0.04):
