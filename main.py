@@ -896,35 +896,81 @@ def _is_valid_ccs_product_name(product):
     return True
 
 
-def get_ccs_note_cards(driver):
-    """Reads every currently-visible card on the CCS Note screen,
-    keeping only ones that pass the validity checks above."""
-    wait_for(driver, (AppiumBy.XPATH,
-             '//android.widget.TextView[@text="CCS Note"]'))
+def _group_ccs_texts_into_cards(card_boxes, text_entries):
+    """
+    Pure function — no driver access, so this is fully testable with
+    synthetic data before ever touching a real device. This is the
+    actual restructuring: instead of asking the phone "what text is
+    inside THIS card" once per card (get_ccs_note_cards() used to call
+    card_el.find_elements() in a loop — one extra device round trip per
+    visible card, every single scroll), every text element currently
+    visible across ALL cards is read in ONE bulk query, then sorted
+    into its owning card here, in Python, using nothing but on-screen
+    position — the same trick group_into_rows() already uses for the
+    main customer list.
 
-    card_elements = driver.find_elements(
-        AppiumBy.XPATH,
-        '//androidx.viewpager.widget.ViewPager//android.view.ViewGroup[@clickable="true"]'
-    )
+    card_boxes: list of (top_y, bottom_y) for each card container,
+                in their original on-screen/document order — this
+                order is preserved in the returned list, matching what
+                get_ccs_note_cards() returned before.
+    text_entries: list of (y1, x1, text) for every text element
+                  currently visible in the card area, from ONE bulk
+                  read — not scoped to any particular card.
+
+    A text element is assigned to whichever card's [top_y, bottom_y]
+    range contains its own y1. Since real cards are stacked vertically
+    and don't overlap, this can't accidentally merge two cards' text
+    together the way a badly-tuned distance-based grouping might — it's
+    checking actual card boundaries, not guessing at spacing. A text
+    element that doesn't fall inside any card's range (e.g. stray text
+    from just above/below the visible card area) is simply dropped,
+    matching the original behavior of only reading text that was
+    inside a card element's own bounds.
+
+    Within each card, group_into_rows() reconstructs proper top-to-
+    bottom, left-to-right reading order from raw (y1, x1, text) tuples
+    — the exact same ordering guarantee this file already relies on
+    elsewhere (see pair_fields/get_visible_customers), rather than
+    trusting incidental element order from a query. Everything AFTER
+    that — pulling out the product name, finding the Last Change value,
+    the validity check — is character-for-character the same logic
+    get_ccs_note_cards() always used; only how the per-card text list
+    gets built has changed.
+    """
+    entries_by_card = [[] for _ in card_boxes]
+    # Check boxes top-to-bottom so a text element right on a boundary
+    # (shouldn't happen for real, non-overlapping cards, but cheap
+    # insurance) consistently resolves to the higher card rather than
+    # being ambiguous.
+    box_order = sorted(range(len(card_boxes)), key=lambda i: card_boxes[i][0])
+    for y1, x1, text in text_entries:
+        for i in box_order:
+            top_y, bottom_y = card_boxes[i]
+            # Half-open interval [top_y, bottom_y) — not <= on both ends.
+            # Two cards stacked with zero gap between them (normal for a
+            # scrollable list) can have one card's bottom_y exactly equal
+            # to the next card's top_y; with an inclusive upper bound, a
+            # text element sitting exactly on that shared line would
+            # match BOTH boxes and silently get assigned to the wrong
+            # (earlier) card. This guarantees every y-coordinate belongs
+            # to exactly one card.
+            if top_y <= y1 < bottom_y:
+                entries_by_card[i].append((y1, x1, text))
+                break
 
     cards = []
-    for card_el in card_elements:
-        parsed = parse_bounds(card_el.get_attribute("bounds"))
-        if not parsed:
-            continue
-        text_elements = card_el.find_elements(
-            AppiumBy.CLASS_NAME, "android.widget.TextView")
-        texts = [read_text_safe(t) for t in text_elements]
-        texts = [t for t in texts if t]  # drop empty separator TextViews
+    for i, (top_y, _bottom_y) in enumerate(card_boxes):
+        rows = group_into_rows(entries_by_card[i])
+        texts = [t for row in rows for _, _, t in row if t]
 
         if not texts:
             continue
 
         product = texts[0]
         last_change = ""
-        for i, t in enumerate(texts):
-            if t == "Last Change" and i + 1 < len(texts):
-                last_change = texts[i + 1]
+        for j, t in enumerate(texts):
+            if t == "Last Change" and j + 1 < len(texts):
+                last_change = texts[j + 1]
 
         if not _is_valid_ccs_product_name(product):
             continue
@@ -932,10 +978,55 @@ def get_ccs_note_cards(driver):
         cards.append({
             "product": product,
             "last_change": last_change,
-            "card_top_y": parsed[1],
+            "card_top_y": top_y,
         })
 
     return cards
+
+
+def get_ccs_note_cards(driver):
+    """Reads every currently-visible card on the CCS Note screen,
+    keeping only ones that pass the validity checks above. See
+    _group_ccs_texts_into_cards() for how the per-card split actually
+    works — this function just does the two device reads (card
+    container bounds, then every text element at once) and hands the
+    results to that pure function."""
+    wait_for(driver, (AppiumBy.XPATH,
+             '//android.widget.TextView[@text="CCS Note"]'))
+
+    card_elements = driver.find_elements(
+        AppiumBy.XPATH,
+        '//androidx.viewpager.widget.ViewPager//android.view.ViewGroup[@clickable="true"]'
+    )
+    card_boxes = []
+    for card_el in card_elements:
+        parsed = parse_bounds(card_el.get_attribute("bounds"))
+        if not parsed:
+            continue
+        _x1, y1, _x2, y2 = parsed
+        card_boxes.append((y1, y2))
+
+    if not card_boxes:
+        return []
+
+    # ONE bulk read for every text element currently visible across ALL
+    # cards — this replaces the old per-card find_elements() loop,
+    # which cost one extra device round trip per visible card.
+    text_elements = driver.find_elements(
+        AppiumBy.XPATH,
+        '//androidx.viewpager.widget.ViewPager//android.widget.TextView'
+    )
+    text_entries = []
+    for el in text_elements:
+        parsed = parse_bounds(el.get_attribute("bounds"))
+        if not parsed:
+            continue
+        x1, y1, _x2, _y2 = parsed
+        text = read_text_safe(el)
+        if text:
+            text_entries.append((y1, x1, text))
+
+    return _group_ccs_texts_into_cards(card_boxes, text_entries)
 
 
 def get_all_ccs_note_cards(driver):
