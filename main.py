@@ -95,6 +95,7 @@ None to process the entire list.
 
 import os
 import re
+import sys
 import time
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -394,6 +395,19 @@ def build_driver():
     options.app_package = APP_PACKAGE
     options.app_activity = APP_ACTIVITY
     options.no_reset = True
+    # Appium auto-terminates a session after this many seconds with NO
+    # commands sent to the device — 60s by default. The pause feature
+    # deliberately sends nothing to the phone for as long as it's
+    # paused, which is exactly what trips this: a quick test pause
+    # (a few seconds) resumes fine, but a real pause (actually using
+    # the phone for a bit) exceeds 60s and gets the session killed
+    # server-side — confirmed by testing: this is exactly what an
+    # InvalidSessionIdException right after "Resuming..." means. Set
+    # generously high (1 hour) so a genuine break doesn't trigger it;
+    # this doesn't weaken any other safety net — MAX_SCROLLS and the
+    # KeyboardInterrupt/Exception handling still catch a run that's
+    # actually stuck for an unrelated reason.
+    options.new_command_timeout = 3600
     return webdriver.Remote("http://127.0.0.1:4723", options=options)
 
 
@@ -1455,6 +1469,109 @@ def _load_carryforward_data():
         wb.close()
 
 
+# ============================================================
+# Live pause/resume — type 'p' + Enter to pause, 'r' + Enter to resume
+# ============================================================
+#
+# Different from the existing Ctrl+C handling: Ctrl+C stops the whole
+# script, and resuming means re-launching Python, re-entering the
+# identity/month prompts, and reconnecting Appium from scratch (though
+# it does correctly pick up the same in-progress file — see
+# _apply_identity_to_filenames()'s "RESUMING AN INTERRUPTED RUN" note).
+# This is for a shorter break — pause the SAME running process (Appium
+# session stays connected, nothing in memory is lost) so the phone is
+# free to use, then continue right where it left off with no restart.
+#
+# Deliberately NOT a background thread. An earlier version of this used
+# one (reading stdin in a loop via input()), and it actually worked
+# correctly for pausing/resuming — but caused a real crash: a thread
+# blocked waiting for keyboard input doesn't get cleaned up properly
+# when the main script finishes, and printed a "Fatal Python error"
+# after every run, successful or not (confirmed by testing). Polling
+# for input from the MAIN thread instead — at the same safe checkpoints
+# the loop already visits — avoids that entirely, since nothing is ever
+# left waiting on stdin when the script exits.
+_pause_requested = False
+_pause_input_buffer = ""
+
+try:
+    import msvcrt  # Windows only — this project runs on Windows
+    _HAS_MSVCRT = True
+except ImportError:
+    _HAS_MSVCRT = False
+    import select  # non-Windows fallback, so this doesn't break on Mac/Linux
+
+
+def _read_pending_stdin_chars():
+    """Returns whatever characters are ALREADY waiting on stdin right
+    now, without blocking — or "" if nothing's been typed yet. Windows
+    uses msvcrt.kbhit()/getwch() (the standard non-blocking keyboard
+    check on that platform); anywhere else, select() checks whether
+    stdin has data ready, then os.read() pulls the raw bytes directly
+    from the file descriptor — NOT sys.stdin.read(), which goes through
+    Python's own internal text-buffering layer. That buffering layer
+    can silently consume more bytes from the OS in one read() than it
+    hands back, so a later select() check sees the file descriptor as
+    empty even though a full line (like a typed 'r') is still sitting
+    unread inside Python's buffer — confirmed by testing: this exact
+    mismatch caused resume to never fire after a real pause. Reading
+    the raw fd directly keeps what select() sees and what actually gets
+    read in sync."""
+    chars = ""
+    if _HAS_MSVCRT:
+        while msvcrt.kbhit():
+            chars += msvcrt.getwch()
+    else:
+        while select.select([sys.stdin], [], [], 0)[0]:
+            data = os.read(sys.stdin.fileno(), 4096)
+            if not data:
+                break
+            chars += data.decode(errors="ignore")
+    return chars
+
+
+def _poll_pause_commands():
+    """Builds up typed characters into a line buffer and checks it
+    against 'p'/'r' once Enter is pressed — same idea as input(), but
+    non-blocking. Called from _wait_if_paused() at safe points in the
+    main loop, so a 'p' typed mid-customer doesn't take effect until
+    that customer is actually finished."""
+    global _pause_requested, _pause_input_buffer
+    for ch in _read_pending_stdin_chars():
+        if ch in ("\r", "\n"):
+            cmd = _pause_input_buffer.strip().lower()
+            _pause_input_buffer = ""
+            if cmd == "p" and not _pause_requested:
+                _pause_requested = True
+                print("Pause requested — will pause after the customer "
+                      "currently in progress finishes (not mid-action). "
+                      "Type 'r' + Enter when you're ready to continue.")
+            elif cmd == "r" and _pause_requested:
+                _pause_requested = False
+                print("Resuming...")
+        else:
+            _pause_input_buffer += ch
+
+
+def _wait_if_paused():
+    """Called at safe boundaries in the main loop — right after a
+    customer is fully finished (back on the plain list screen, no
+    popup open, nothing mid-read) or after a scroll with nothing new
+    to act on. NEVER called mid-tap or mid-read, so pausing here can't
+    leave the phone in a half-navigated state."""
+    _poll_pause_commands()
+    if not _pause_requested:
+        return
+    print("\nPaused. The phone won't be touched again until you resume.\n"
+          "If you switch to a DIFFERENT app on the phone, make sure "
+          "Cuckoo+ is back in the foreground before typing 'r' — this "
+          "script taps raw screen positions, not the app specifically, "
+          "so the next action needs Cuckoo+ to actually be on screen.")
+    while _pause_requested:
+        time.sleep(0.5)
+        _poll_pause_commands()
+
+
 def run():
     import traceback
 
@@ -1481,6 +1598,10 @@ def run():
 
     driver = build_driver()
     time.sleep(3)
+
+    print("Tip: type 'p' + Enter anytime during this run to pause after "
+          "the current customer finishes, and 'r' + Enter to resume — "
+          "the connection to the phone stays open, nothing gets re-scraped.")
 
     all_records = []
     all_ccs_rows = []
@@ -1511,6 +1632,8 @@ def run():
 
     try:
         while True:
+            _wait_if_paused()
+
             if LIST_LIMIT and len(all_records) >= LIST_LIMIT:
                 print(f"Reached LIST_LIMIT of {LIST_LIMIT} — stopping.")
                 break
