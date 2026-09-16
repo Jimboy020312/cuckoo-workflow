@@ -1942,13 +1942,37 @@ def run():
           f"customer(s), {len(carried_to_keep)} carried forward unchanged "
           f"({len(merged_records)} total), {len(all_ccs_rows)} new CCS Note "
           f"row(s) read.")
+    skip_count = len(carried_to_keep)
+    detail_time = sum(customer_durations)
+    # Exact, not an estimate — the ONLY thing timed separately per-
+    # customer is a newly-scraped customer's View Order + CCS Note visit
+    # (customer_start_time/customer_elapsed). Everything else the loop
+    # does — scrolling, the quick/stable screen reads, skip decisions —
+    # is NOT individually timed, so "everything else" is whatever's left
+    # after subtracting the one thing that IS precisely measured. This
+    # bucket isn't PURELY "time skipping known customers" — it also
+    # includes the screen-reading that happens right before a NEW
+    # customer is found too, not just before a skip — but when most of
+    # a run's customers are already-known (the normal case after month
+    # one), this bucket is realistically dominated by skip-related
+    # scrolling.
+    other_time = max(0, total_elapsed - detail_time)
+    print(f"Total time: {_format_duration(total_elapsed)}")
     if customer_durations:
-        avg_seconds = sum(customer_durations) / len(customer_durations)
-        print(f"Total time: {_format_duration(total_elapsed)} | "
-              f"average {avg_seconds:.1f}s per NEWLY-scraped customer "
-              f"({len(customer_durations)} processed)")
+        avg_seconds = detail_time / len(customer_durations)
+        print(f"  New customers: {len(customer_durations)} scraped, "
+              f"{_format_duration(detail_time)} total (avg {avg_seconds:.1f}s each)")
     else:
-        print(f"Total time: {_format_duration(total_elapsed)}")
+        print("  New customers: none scraped this run")
+    if skip_count:
+        avg_skip = other_time / skip_count
+        print(f"  Everything else — scrolling, screen reads, and skipping "
+              f"{skip_count} already-known customer(s): "
+              f"{_format_duration(other_time)} total (~{avg_skip:.1f}s per "
+              f"skipped customer, though this bucket isn't purely skip time)")
+    else:
+        print(f"  Everything else (scrolling/screen reads, no known "
+              f"customers to skip this run): {_format_duration(other_time)}")
 
 
 # ============================================================
